@@ -6,33 +6,33 @@ Standalone script for running on a target machine that has Excel + Python.
 Pipeline
 --------
 1. Open MacroQRAV6 (version 1).xlsm via xlwings
-2. Read PageControl  → determine which Impact IDs are active
+2. Read PageControl  → determine which Impact IDs are active and where to print matrices
 3. For each active Impact ID:
      a. Set Core!C2 = impact_id  →  force recalculation
      b. Read Core scenarios (A4:R89)
-     c. Read Directions  →  get destination ranges per size (Total/S/M/L/XL/INST)
+     c. Read PageControl  →  get destination ranges per size (Total/S/M/L/XL/INST)
      d. Read the corresponding effect results sheet
      e. Compute impact & risk matrices on the QY×QX grid
 4. Create (or overwrite) two sheets in the workbook:
         "Impact Matrix Result"
         "Risk Matrix Result"
-5. Write each matrix at the destination range found in Directions
+5. Write each matrix at the destination range found in PageControl
 6. Save workbook as macro-disabled .xlsx  (no macro = safe for export)
  
 PageControl sheet assumptions
 ------------------------------
   Row 1  = header
-  Col A  = Impact ID   (integer, e.g. 16, 17 … 23)
-  Col B  = Event name  (e.g. TOXIC, JF …)         [informational]
-  Col C  = Active flag (1 = active, 0 / blank = skip)
- 
-Directions sheet assumptions
------------------------------
-  Row 1  = header
-  Col A  = Impact ID   (integer)
-  Col B  = Size label  (Total / S / M / L / XL / INST)
-  Col C  = Destination range string  (e.g. '$LD$318:$XF$634')
-             used to position the matrix in the result sheets
+  Col J  = Event name / result sheet description
+  Col L  = Impact ID   (integer, e.g. 16, 17 … 24)
+  Col M  = Impact Total destination range
+  Col N  = Impact Small destination range
+  Col O  = Impact Medium destination range
+  Col P  = Impact Large destination range
+  Col Q  = Impact XLarge destination range
+  Col R  = Impact Instantaneous destination range
+
+All PageControl rows with a valid impact ID and at least one matrix range are active.
+The same destination ranges are used for both Impact and Risk result sheets.
 """
  
 import os
@@ -47,10 +47,10 @@ sys.stdout.reconfigure(encoding='utf-8')
  
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # Change these two lines for the target machine
-_WORKSPACE   = r'C:\Users\herra\OneDrive - Chevron\python\QRA_tool'
+_WORKSPACE   = r'c:\Users\ASUS\OneDrive\Escritorio\qra_auto_project'
 V6_PATH      = os.path.join(_WORKSPACE, 'MacroQRAV6 (version 1).xlsm')
 EXPORT_PATH  = os.path.join(_WORKSPACE, 'MacroQRAV6_export_result.xlsx')  # output file
- 
+  
 # ── Grid ──────────────────────────────────────────────────────────────────────
 QX = 315
 QY = 317
@@ -62,6 +62,18 @@ _yc = SY * (np.arange(QY) + 0.5)
 XX, YY = np.meshgrid(_xc, _yc)
  
 SIZES = ['Total', 'S', 'M', 'L', 'XL', 'INST']
+
+PAGECONTROL_DATA_RANGE = 'J2:R500'
+PAGECONTROL_EVENT_COL = 0
+PAGECONTROL_IMPACT_ID_COL = 2
+PAGECONTROL_RANGE_COLS = {
+    'Total': 3,
+    'S': 4,
+    'M': 5,
+    'L': 6,
+    'XL': 7,
+    'INST': 8,
+}
  
 # ── Formula constants ─────────────────────────────────────────────────────────
 THERM_THRESHOLDS  = np.array([1.6, 5.0, 7.3, 9.5, 12.5, 16.0, 20.9, 25.0, 30.0, 35.0])
@@ -151,41 +163,63 @@ def formula_toxic(dist, tox_dists, tox_probs):
  
  
 # ═══════════════════════════════════════════════════════════════════════════════
-# PageControl reader
+# PageControl readers
 # ═══════════════════════════════════════════════════════════════════════════════
  
+def _as_text(value):
+    return str(value).strip() if value is not None else ''
+
+
+def _looks_like_excel_range(value):
+    text = _as_text(value).replace('$', '')
+    return bool(re.match(r'^[A-Za-z]+\d+:[A-Za-z]+\d+$', text))
+
+
+def _page_control_row_ranges(row):
+    ranges = {}
+    for size, col_idx in PAGECONTROL_RANGE_COLS.items():
+        range_str = _as_text(row[col_idx])
+        if _looks_like_excel_range(range_str):
+            ranges[size] = range_str
+    return ranges
+
+
 def read_page_control(ws_pc):
     """
     Read PageControl sheet.
-    Returns dict: {impact_id (int): True}  for all active impacts.
- 
-    Expected layout (row 1 = header):
-      Col A = Impact ID
-      Col B = Event name   (ignored here)
-      Col C = Active flag  (1 = active)
+    Returns dict: {impact_id (int): True} for all active impacts.
+
+    PageControl layout (row 1 = header):
+      Col J = Event name / result sheet description
+      Col L = Impact ID
+      Col M:R = destination ranges for Total/S/M/L/XL/INST
+
+    There is no active flag in the current workbook; valid rows are active.
     """
     active = {}
     print("  Reading PageControl...")
-    data = ws_pc.range('A2:C100').value
+    data = ws_pc.range(PAGECONTROL_DATA_RANGE).value
     if not data:
         print("  WARNING: PageControl appears empty — will use all IMPACT_CONFIG entries.")
         return {iid: True for iid in IMPACT_CONFIG}
  
     for row in data:
-        if not row or row[0] is None:
-            break
+        if not row or all(cell is None for cell in row):
+            if active:
+                break
+            continue
         try:
-            iid  = int(row[0])
-            flag = row[2]
-            if flag is None or str(flag).strip() == '':
-                # Treat blank as active
-                active[iid] = True
-            elif float(flag) == 1.0:
-                active[iid] = True
-            else:
-                print(f"    Impact ID {iid} flagged inactive — skipping.")
+            iid = int(row[PAGECONTROL_IMPACT_ID_COL])
         except (ValueError, TypeError):
             continue
+
+        if not _page_control_row_ranges(row):
+            continue
+
+        event_name = _as_text(row[PAGECONTROL_EVENT_COL])
+        active[iid] = True
+        if event_name:
+            print(f"    Impact ID {iid}: {event_name}")
  
     if not active:
         print("  WARNING: No active impacts found in PageControl — using all.")
@@ -196,43 +230,41 @@ def read_page_control(ws_pc):
  
  
 # ═══════════════════════════════════════════════════════════════════════════════
-# Directions reader
+# PageControl placement-range reader
 # ═══════════════════════════════════════════════════════════════════════════════
  
-def read_directions(ws_dir):
+def read_directions(ws_pc):
     """
-    Read Directions sheet.
+    Read destination ranges from PageControl.
     Returns dict: {impact_id (int): {size (str): range_str (str)}}
  
-    Expected layout (row 1 = header):
-      Col A = Impact ID
-      Col B = Size  (Total / S / M / L / XL / INST)
-      Col C = Destination range  e.g. '$LD$318:$XF$634'
+    PageControl layout (row 1 = header):
+      Col L = Impact ID
+      Col M = Total, N = S, O = M, P = L, Q = XL, R = INST
     """
     directions = {}
-    print("  Reading Directions...")
-    data = ws_dir.range('A2:C500').value
+    print("  Reading PageControl destination ranges...")
+    data = ws_pc.range(PAGECONTROL_DATA_RANGE).value
     if not data:
-        print("  WARNING: Directions sheet appears empty.")
+        print("  WARNING: PageControl appears empty; no destination ranges loaded.")
         return directions
  
     for row in data:
-        if not row or row[0] is None:
-            break
+        if not row or all(cell is None for cell in row):
+            if directions:
+                break
+            continue
         try:
-            iid  = int(row[0])
-            sz   = str(row[1]).strip() if row[1] else ''
-            rng  = str(row[2]).strip() if row[2] else ''
+            iid = int(row[PAGECONTROL_IMPACT_ID_COL])
         except (ValueError, TypeError):
             continue
  
-        if sz not in SIZES or not rng:
-            continue
- 
-        directions.setdefault(iid, {})[sz] = rng
+        ranges = _page_control_row_ranges(row)
+        if ranges:
+            directions[iid] = ranges
  
     total_entries = sum(len(v) for v in directions.values())
-    print(f"  Directions loaded: {len(directions)} impacts, {total_entries} size-range entries.")
+    print(f"  PageControl ranges loaded: {len(directions)} impacts, {total_entries} size-range entries.")
     return directions
  
  
@@ -443,10 +475,10 @@ def _ensure_sheet(wb, name):
 def write_result_sheets(wb, all_results, directions):
     """
     all_results : {impact_id: {'impact': {sz: ndarray}, 'risk': {sz: ndarray}}}
-    directions  : {impact_id: {sz: range_str}}
+    directions  : {impact_id: {sz: range_str}} read from PageControl columns M:R
  
     Writes matrices into SHEET_IMPACT and SHEET_RISK.
-    Each matrix is placed starting at the top-left cell of the direction range.
+    Each matrix is placed starting at the top-left cell of the PageControl range.
     """
     print(f"\n  Creating result sheets …")
     ws_imp  = _ensure_sheet(wb, SHEET_IMPACT)
@@ -460,7 +492,7 @@ def write_result_sheets(wb, all_results, directions):
     for impact_id, res in all_results.items():
         dir_map = directions.get(impact_id, {})
         if not dir_map:
-            print(f"    Impact ID {impact_id}: no Directions entries — matrices not placed in sheet.")
+            print(f"    Impact ID {impact_id}: no PageControl ranges — matrices not placed in sheet.")
             continue
  
         imp_mats  = res['impact']
@@ -469,7 +501,7 @@ def write_result_sheets(wb, all_results, directions):
         for sz in SIZES:
             rng_str = dir_map.get(sz)
             if not rng_str:
-                continue   # this size not mapped in Directions — skip silently
+                continue   # this size not mapped in PageControl — skip silently
  
             try:
                 start_row, start_col = _parse_range_start(rng_str)
@@ -519,7 +551,7 @@ def main():
  
         # ── Verify required sheets exist ──────────────────────────────────────
         sheet_names = [s.name for s in wb.sheets]
-        for required in ('Core', 'PageControl', 'Directions'):
+        for required in ('Core', 'PageControl'):
             if required not in sheet_names:
                 print(f"\n  WARNING: Sheet '{required}' not found.")
                 print(f"  Available sheets: {sheet_names}")
@@ -531,11 +563,11 @@ def main():
             print("  PageControl sheet missing — using all IMPACT_CONFIG entries.")
             active_impacts = {iid: True for iid in IMPACT_CONFIG}
  
-        # ── Read Directions ───────────────────────────────────────────────────
-        if 'Directions' in sheet_names:
-            directions = read_directions(wb.sheets['Directions'])
+        # ── Read destination ranges from PageControl ──────────────────────────
+        if 'PageControl' in sheet_names:
+            directions = read_directions(wb.sheets['PageControl'])
         else:
-            print("  Directions sheet missing — matrices will be computed but NOT placed in result sheets.")
+            print("  PageControl sheet missing — matrices will be computed but NOT placed in result sheets.")
             directions = {}
  
         # ── Iterate impacts ───────────────────────────────────────────────────
