@@ -43,12 +43,15 @@ import time
 
 import numpy as np
 import xlwings as xw
+from dotenv import load_dotenv
 
 sys.stdout.reconfigure(encoding='utf-8')
 
+load_dotenv()
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
-# Change _WORKSPACE to the folder that contains MacroQRAV6 (version 1).xlsm
-_WORKSPACE   = r'c:\Users\ASUS\OneDrive\Escritorio\qra_auto_project'
+# _WORKSPACE is loaded from .env file; falls back to current directory if not found
+_WORKSPACE   = os.getenv('WORKSPACE', os.getcwd())
 V6_PATH      = os.path.join(_WORKSPACE, 'MacroQRAV6 (version 1).xlsm')
 EXPORT_PATH  = os.path.join(_WORKSPACE, 'MacroQRAV6_export_result.xlsx')
 
@@ -796,17 +799,8 @@ def export_matrices_csv(all_results, output_dir, directions=None):
 # Excel result writers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _bulk_write(ws_api, start_row, start_col, matrix):
-    """Write 2-D numpy array to Excel via direct COM API.
-
-    Using ws_api.Cells(...).Resize(...).Value = data bypasses xlwings Python
-    overhead and sends the entire block in a single COM call, which is
-    significantly faster than iterating rows or using xlwings range().value
-    for matrices > ~10k cells.
-    """
-    data = tuple(tuple(float(v) for v in row) for row in matrix.tolist())
-    nrows, ncols = matrix.shape
-    ws_api.Cells(start_row, start_col).Resize(nrows, ncols).Value = data
+def _bulk_write(ws, start_row, start_col, matrix):
+    ws.range((start_row, start_col)).value = np.nan_to_num(matrix).tolist()
 
 
 def _ensure_sheet(wb, name):
@@ -820,38 +814,20 @@ def _ensure_sheet(wb, name):
 
 
 def write_result_sheets(wb, all_results, directions):
-    """Write all impact and risk matrices into SHEET_IMPACT and SHEET_RISK.
-
-    Temporarily disables Excel events and auto-calculation for maximum write speed.
-    """
-    print(f'\n  Creating result sheets …')
     ws_imp  = _ensure_sheet(wb, SHEET_IMPACT)
     ws_risk = _ensure_sheet(wb, SHEET_RISK)
 
-    ws_imp.range('A1').value  = f'{SHEET_IMPACT} — written by qra_v6_engine.py'
-    ws_risk.range('A1').value = f'{SHEET_RISK}   — written by qra_v6_engine.py'
-
     app = wb.app
+    app.api.ScreenUpdating = False
     app.api.Calculation    = -4135   # xlCalculationManual
     app.api.EnableEvents   = False
-
-    # Always write the summed Total matrices at A2 so they are visible on open
-    imp_final, risk_final = _sum_final_matrices(all_results)
-    _bulk_write(ws_imp.api,  2, 1, imp_final)
-    _bulk_write(ws_risk.api, 2, 1, risk_final)
-    print(f'  Summed Total matrices written at A2  ({imp_final.shape[0]}x{imp_final.shape[1]})')
-
-    print(f'  Direction map: {len(directions)} impact IDs with destination ranges')
-    if not directions:
-        _warn('directions dict is empty — per-event/size blocks skipped; summed matrix at A2 is the only result.')
 
     written = 0
     try:
         for impact_id, res in all_results.items():
-            dir_map    = directions.get(impact_id, {})
-            imp_mats   = res['impact']
-            risk_mats  = res['risk']
-            event_name = res['event']
+            dir_map   = directions.get(impact_id, {})
+            imp_mats  = res['impact']
+            risk_mats = res['risk']
 
             for sz in SIZES:
                 rng_str = dir_map.get(sz)
@@ -863,16 +839,19 @@ def write_result_sheets(wb, all_results, directions):
                     _warn(str(e))
                     continue
 
-                _bulk_write(ws_imp.api,  sr, sc, imp_mats[sz])
-                _bulk_write(ws_risk.api, sr, sc, risk_mats[sz])
+                _bulk_write(ws_imp,  sr, sc, imp_mats[sz])
+                _bulk_write(ws_risk, sr, sc, risk_mats[sz])
                 written += 1
-                print(f'    [{event_name}/{sz}] → {rng_str}  (row {sr}, col {sc})')
+                print(f'    [{res["event"]}/{sz}] → row {sr}, col {sc}')
 
     finally:
-        app.api.Calculation  = -4105   # xlCalculationAutomatic
-        app.api.EnableEvents = True
+        app.api.ScreenUpdating = True
+        app.api.Calculation    = -4105   # xlCalculationAutomatic
+        app.api.EnableEvents   = True
 
-    print(f'  Matrices written: {written} blocks total.')
+    if not written:
+        _warn('No blocks written — directions map may be empty or all_results is empty.')
+    print(f'  {written} blocks written.')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
