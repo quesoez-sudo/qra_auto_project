@@ -94,7 +94,7 @@ _SIZE_NORM   = {sz.upper(): sz for sz in SIZES}   # case-insensitive lookup
 # prob_idx : 0-based index into the Core row (col A = 0) for this event's frequency
 IMPACT_CONFIG = {
     16: {'sheet': 'Outdoor Toxic Results',  'event': 'TOXIC', 'prob_idx': 9,  'formula': 'toxic'},
-    17: {'sheet': 'Jet Fire Results',        'event': 'JF',    'prob_idx': 10, 'formula': 'thermal'},
+    17: {'sheet': 'Jet Fire Results',        'event': 'JF',    'prob_idx': 10, 'formula': 'jf_ellipse'},
     18: {'sheet': 'Late Pool Fire Results',  'event': 'LPF',   'prob_idx': 11, 'formula': 'thermal'},
     19: {'sheet': 'Early Pool Fire Results', 'event': 'EPF',   'prob_idx': 12, 'formula': 'thermal'},
     20: {'sheet': 'Fireball Results',        'event': 'FB',    'prob_idx': 13, 'formula': 'thermal'},
@@ -126,6 +126,10 @@ _GEN_FF_RC       = (18, 10)   # J18 start; 3 values: outside / transition / insi
 _GEN_EXP_RC      = (19, 10)   # J19 start; up to 5 values
 _GEN_TOX_RC      = (20, 10)   # J20 start; first value = min probability filter
 _GEN_TEXP_RC     = (21,  4)   # D21: thermal exposure time [s]
+_GEN_JF_INDEX_RC  = (22,  4)   # D22: JF direction index count
+_GEN_JF_OFFSET_RC = (23,  4)   # D23: JF angle offset [deg]
+_GEN_JF_DIRS_RC   = (24,  4)   # D24: JF number of directions
+_GEN_JF_STEP_RC   = (25,  4)   # D25: JF angle step [deg] (0 = equal spacing)
 
 # ── Module-level grid (populated by load_general_params) ─────────────────────
 XX = None   # (QY, QX) array of cell-centre X coordinates [m]
@@ -215,6 +219,10 @@ def load_general_params(wb):
         'EXP_THRESHOLDS':   exp,
         'TOX_MIN_PROB':     float(tox[0]) if len(tox) > 0 else 0.01,
         'THERM_T_EXP':      float(t_exp)  if t_exp is not None else 20.0,
+        'JF_THRESHOLDS':    np.array([1.6, 5.0, 7.3, 9.5, 12.5, 16.0, 20.9, 25.0, 30.0, 35.0]),
+        'JF_DIRECTIONS':    int(_fv(_GEN_JF_DIRS_RC)  or 8),
+        'JF_ANGLE_OFFSET':  float(_fv(_GEN_JF_OFFSET_RC) or 0.0),
+        'JF_ANGLE_STEP':    float(_fv(_GEN_JF_STEP_RC)   or 0.0),
     }
     return _P
 
@@ -235,6 +243,13 @@ def print_params(p):
           f'[NOT from General sheet — verify with project team]')
     print(f'  Tox min prob    : {p["TOX_MIN_PROB"]}')
     print(f'  Thermal t_exp   : {p["THERM_T_EXP"]} s')
+    angle_step_label = ('equal-spacing (360/n)'
+                        if p["JF_ANGLE_STEP"] == 0
+                        else f'{p["JF_ANGLE_STEP"]} deg')
+    print(f'  JF directions   : {p["JF_DIRECTIONS"]}  '
+          f'offset={p["JF_ANGLE_OFFSET"]} deg  '
+          f'step={angle_step_label}')
+    print(f'  JF kW/m²        : {p["JF_THRESHOLDS"].tolist()}')
     print(sep + '\n')
 
 
@@ -245,6 +260,71 @@ def print_params(p):
 def dist_grid(sx, sy):
     """Euclidean distance [m] from point (sx, sy) to every grid cell → (QY, QX)."""
     return np.sqrt((XX - sx) ** 2 + (YY - sy) ** 2)
+
+
+def formula_jf(sx, sy, dist_vals, halfW_vals, center_vals):
+    """Jet Fire directional ellipse impact formula.
+
+    For each of JF_DIRECTIONS equally-spaced jet angles, builds an ellipse for
+    each kW/m² threshold.  Returns the highest threshold kW/m² for which the
+    cell falls inside at least one directional ellipse.
+
+    All spatial quantities are in cell units (distances from ImpactJFMatrix are
+    stored in cell units, consistent with the Excel formula dividing by SX/SY).
+
+    Returns (QY, QX) array of kW/m² values (0.0 or one of JF_THRESHOLDS).
+    """
+    SX = _P['SX']
+    SY = _P['SY']
+    thresholds  = _P['JF_THRESHOLDS']
+    n_dirs      = _P['JF_DIRECTIONS']
+    offset      = _P['JF_ANGLE_OFFSET']
+    step        = _P['JF_ANGLE_STEP']
+
+    x_rel = (XX - sx) / SX   # (QY, QX) cell-unit X offset from source
+    y_rel = (YY - sy) / SY   # (QY, QX) cell-unit Y offset from source
+
+    if step == 0:
+        angles_deg = offset + np.arange(n_dirs) * 360.0 / n_dirs
+    else:
+        angles_deg = offset + np.arange(n_dirs) * step
+
+    ct = np.cos(np.radians(angles_deg))   # (n_dirs,)
+    st = np.sin(np.radians(angles_deg))   # (n_dirs,)
+
+    x_exp = x_rel[..., np.newaxis]   # (QY, QX, 1)
+    y_exp = y_rel[..., np.newaxis]
+
+    result = np.zeros((int(_P['QY']), int(_P['QX'])))
+
+    for i in range(len(thresholds)):
+        dist   = dist_vals[i]
+        halfW  = halfW_vals[i]
+        center = center_vals[i]
+
+        if dist is None or halfW is None or center is None:
+            continue
+        if dist <= 0 or halfW <= 0:
+            continue
+
+        a = dist - center
+        b = halfW
+        c = center
+
+        if a <= 0:
+            continue
+
+        imp = thresholds[i]
+
+        proj_along = x_exp * ct + y_exp * st - c   # (QY, QX, n_dirs)
+        proj_perp  = x_exp * st - y_exp * ct       # (QY, QX, n_dirs)
+
+        eVals = (proj_along / a) ** 2 + (proj_perp / b) ** 2
+
+        inside_any = np.any(eVals <= 1.0, axis=2)   # (QY, QX) bool
+        result = np.where(inside_any, np.maximum(result, imp), result)
+
+    return result
 
 
 def formula_thermal(dist, therm_dists):
@@ -487,6 +567,36 @@ def _match_threshold_cols(headers, thresholds, sheet_name=''):
 # Result-sheet readers
 # ══════════════════════════════════════════════════════════════════════════════
 
+def read_jf_results(ws, max_rows=1200):
+    """Read JF ellipse data from ImpactJFMatrix-style sheet.
+
+    Expected column layout (mirrors ImpactJFMatrix in KernelV0):
+      Col B: path key
+      Cols F:O  (6-15):  far-tip distances for 10 kW/m² thresholds (cell units)
+      Cols P:Y  (16-25): semi-minor axis (half-width) for 10 thresholds (cell units)
+      Cols Z:AI (26-35): center distances for 10 thresholds (cell units)
+
+    Returns: {path_key: {'dist': [...], 'halfW': [...], 'center': [...]}}
+    """
+    def _flt(v):
+        return float(v) if isinstance(v, (int, float)) else None
+
+    results = {}
+    for r in range(2, max_rows):
+        path = ws.range((r, 2)).value
+        if not path:
+            break
+        row_d = ws.range((r, 6),  (r, 15)).value or []
+        row_w = ws.range((r, 16), (r, 25)).value or []
+        row_c = ws.range((r, 26), (r, 35)).value or []
+        results[str(path)] = {
+            'dist':   [_flt(v) for v in row_d],
+            'halfW':  [_flt(v) for v in row_w],
+            'center': [_flt(v) for v in row_c],
+        }
+    return results
+
+
 def read_thermal_results(ws, max_rows=1200):
     """Read thermal radiation distance columns, matched dynamically to thresholds.
 
@@ -704,6 +814,8 @@ def compute_event(formula_type, prob_idx, scenarios, results_data, is_cve=False)
             elif formula_type == 'toxic':
                 tox_d, tox_p = entry['dists']
                 cell_imp = formula_toxic(d, tox_d, tox_p)
+            elif formula_type == 'jf_ellipse':
+                cell_imp = formula_jf(sx, sy, entry['dist'], entry['halfW'], entry['center'])
             else:
                 continue
 
