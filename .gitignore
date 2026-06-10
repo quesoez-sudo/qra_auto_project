@@ -62,3 +62,6 @@ Thumbs.db
 # Project specific
 *.log
 MacroQRAV6_export_result.xlsx
+
+#.env file for environment variables (not to be committed to version control)
+.env
