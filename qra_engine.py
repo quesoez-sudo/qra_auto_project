@@ -41,7 +41,7 @@ SIZES = ['Total', 'S', 'M', 'L', 'XL', 'INST']
 # prob_col: 1-indexed openpyxl column in Core sheet (J=10..Q=17)
 EVENTS = [
     dict(name='TOXIC',    sheet='ImpactToxMatrix',   prob_col=10, formula='toxic'),
-    dict(name='JF',       sheet='ImpactThermMatrix', prob_col=11, formula='thermal'),
+    dict(name='JF',       sheet='ImpactJFMatrix',    prob_col=11, formula='jf_ellipse'),
     dict(name='LPF',      sheet='ImpactThermMatrix', prob_col=12, formula='thermal'),
     dict(name='EPF',      sheet='ImpactThermMatrix', prob_col=13, formula='thermal'),
     dict(name='FB',       sheet='ImpactThermMatrix', prob_col=14, formula='thermal'),
@@ -68,6 +68,14 @@ EXP_LIM_F2  = 1.0   # limitF2  — AA18
 FF_OUTSIDE    = 0.0   # limit1 (AA15)
 FF_TRANSITION = 1.0   # limit2 (AA16)
 FF_INSIDE_LFL = 2.0   # limit3 (AA17)
+
+# ── Jet Fire formula constants ────────────────────────────────────────────────
+# kW/m² thresholds → ImpactJFMatrix cols F-O (col indices 6-15)
+JF_THRESHOLDS  = np.array([1.6, 5.0, 7.3, 9.5, 12.5, 16.0, 20.9, 25.0, 30.0, 35.0])
+JF_DIRECTIONS  = 8      # number of equally-spaced jet-fire directions (AL25)
+JF_ANGLE_OFFSET = 0.0   # starting angle in degrees (AL24)
+JF_ANGLE_STEP  = 0      # 0 = equal spacing (360/n_dirs); >0 = fixed step [deg] (AL26)
+
  
 # ── Toxic formula constants ───────────────────────────────────────────────────
 TOX_MIN_PROB = 0.01   # AA15: minimum probability row to include from blob
@@ -176,6 +184,33 @@ def read_thermal_scenarios(wb, core):
     return scenarios
  
  
+def read_jf_scenarios(wb, core):
+    """
+    ImpactJFMatrix columns:
+      B=key, F:O=far-tip distances (10 thresholds, cell units),
+      P:Y=half-widths (semi-minor axis, cell units),
+      Z:AI=center distances (cell units).
+    """
+    ws = wb['ImpactJFMatrix']
+    scenarios = []
+    for r in range(2, ws.max_row + 1):
+        key = ws.cell(r, 2).value
+        if not key or key not in core:
+            continue
+        dist_vals   = [_safe_float(ws.cell(r, c).value) for c in range(6,  16)]
+        halfW_vals  = [_safe_float(ws.cell(r, c).value) for c in range(16, 26)]
+        center_vals = [_safe_float(ws.cell(r, c).value) for c in range(26, 36)]
+        scenarios.append(dict(
+            key=key,
+            sx=core[key]['x'], sy=core[key]['y'],
+            dist_vals=dist_vals,
+            halfW_vals=halfW_vals,
+            center_vals=center_vals,
+            size=core[key]['size'], probs=core[key]['probs'],
+        ))
+    return scenarios
+ 
+ 
 def read_explosion_scenarios(wb, core):
     """
     ImpactExpMatrix columns: B=key, J-N=overpressure distances[m], V=ign_X, W=ign_Y.
@@ -259,6 +294,67 @@ def formula_ff(dist, lfl_dist, lflf_dist):
     return result
  
  
+def formula_jf(sx, sy, dist_vals, halfW_vals, center_vals):
+    """
+    Jet Fire directional ellipse impact formula.
+
+    For each of JF_DIRECTIONS equally-spaced jet angles, builds an ellipse for
+    each kW/m² threshold (cols F:O, P:Y, Z:AI of ImpactJFMatrix).  A grid cell
+    is assigned the highest threshold kW/m² value for which it falls inside at
+    least one directional ellipse.
+
+    All spatial quantities are in cell units (distances stored in ImpactJFMatrix
+    are in cell units, consistent with the Excel formula dividing by SX/SY).
+
+    Returns (QY, QX) array of kW/m² values (0.0 or one of JF_THRESHOLDS).
+    """
+    x_rel = (XX - sx) / SX   # (QY, QX) cell-unit X offset from source
+    y_rel = (YY - sy) / SY   # (QY, QX) cell-unit Y offset from source
+
+    if JF_ANGLE_STEP == 0:
+        angles_deg = JF_ANGLE_OFFSET + np.arange(JF_DIRECTIONS) * 360.0 / JF_DIRECTIONS
+    else:
+        angles_deg = JF_ANGLE_OFFSET + np.arange(JF_DIRECTIONS) * JF_ANGLE_STEP
+
+    ct = np.cos(np.radians(angles_deg))   # (n_dirs,)
+    st = np.sin(np.radians(angles_deg))   # (n_dirs,)
+
+    x_exp = x_rel[..., np.newaxis]   # (QY, QX, 1) for broadcasting with n_dirs
+    y_exp = y_rel[..., np.newaxis]
+
+    result = np.zeros((QY, QX))
+
+    for i in range(len(JF_THRESHOLDS)):
+        dist   = dist_vals[i]
+        halfW  = halfW_vals[i]
+        center = center_vals[i]
+
+        if dist is None or halfW is None or center is None:
+            continue
+        if dist <= 0 or halfW <= 0:
+            continue
+
+        a = dist - center   # semi-major axis
+        b = halfW           # semi-minor axis
+        c = center          # center distance from source
+
+        if a <= 0:
+            continue
+
+        imp = JF_THRESHOLDS[i]
+
+        # Projection onto jet axis and perpendicular for all directions at once
+        proj_along = x_exp * ct + y_exp * st - c   # (QY, QX, n_dirs)
+        proj_perp  = x_exp * st - y_exp * ct       # (QY, QX, n_dirs)
+
+        eVals = (proj_along / a) ** 2 + (proj_perp / b) ** 2   # (QY, QX, n_dirs)
+
+        inside_any = np.any(eVals <= 1.0, axis=2)   # (QY, QX) bool
+        result = np.where(inside_any, np.maximum(result, imp), result)
+
+    return result
+
+
 def formula_thermal(dist, therm_dists):
     """
     Thermal radiation impact: interpolate kW/m² from threshold distances,
@@ -292,8 +388,11 @@ def formula_thermal(dist, therm_dists):
     mask = kw_at_cell > 0.0
     if np.any(mask):
         kw = kw_at_cell[mask]
+        certain = kw >= THERM_THRESHOLDS[-1]
         probit = -36.38 + 2.56 * np.log((1000.0 * kw) ** (4.0 / 3.0) * THERM_T_EXP)
-        result[mask] = np.clip(_norm_cdf(probit - 5.0), 0.0, 1.0)
+        p = np.clip(_norm_cdf(probit - 5.0), 0.0, 1.0)
+        p[certain] = 1.0
+        result[mask] = p
  
     return result
  
@@ -343,7 +442,7 @@ def formula_toxic(dist, tox_dists, tox_probs):
         return np.zeros(dist.shape)
     result = np.interp(
         dist, tox_dists, tox_probs,
-        left=tox_probs[0],    # very close → use highest available probability
+        left=1.0,             # very close → certain fatality (matches Excel)
         right=0.0             # beyond max distance → 0
     )
     return np.clip(result, 0.0, 1.0)
@@ -393,6 +492,8 @@ def run_event(event, scenarios):
             cell_imp = formula_explosion(d, sc['exp_dists'])
         elif formula == 'toxic':
             cell_imp = formula_toxic(d, sc['tox_dists'], sc['tox_probs'])
+        elif formula == 'jf_ellipse':
+            cell_imp = formula_jf(sx, sy, sc['dist_vals'], sc['halfW_vals'], sc['center_vals'])
         else:
             continue   # 'zero' formula → skip
  
@@ -546,22 +647,28 @@ def main():
     print('  %d scenarios with coordinates loaded from Core.' % len(core))
  
     print('Reading impact sheets...')
-    ff_scen   = read_ff_scenarios(wb, core)
+    ff_scen    = read_ff_scenarios(wb, core)
     therm_scen = read_thermal_scenarios(wb, core)
-    exp_scen  = read_explosion_scenarios(wb, core)
-    tox_scen  = read_toxic_scenarios(wb, core)
-    print('  FF=%d  Thermal=%d  Explosion=%d  Toxic=%d  scenarios matched to Core'
-          % (len(ff_scen), len(therm_scen), len(exp_scen), len(tox_scen)))
+    exp_scen   = read_explosion_scenarios(wb, core)
+    tox_scen   = read_toxic_scenarios(wb, core)
+    jf_scen    = read_jf_scenarios(wb, core) if 'ImpactJFMatrix' in wb.sheetnames else []
+    print('  FF=%d  Thermal=%d  Explosion=%d  Toxic=%d  JF=%d  scenarios matched to Core'
+          % (len(ff_scen), len(therm_scen), len(exp_scen), len(tox_scen), len(jf_scen)))
  
     scenario_map = {
-        'ff':        ff_scen,
-        'thermal':   therm_scen,
-        'explosion': exp_scen,
-        'toxic':     tox_scen,
-        'zero':      [],
+        'ff':         ff_scen,
+        'thermal':    therm_scen,
+        'explosion':  exp_scen,
+        'toxic':      tox_scen,
+        'jf_ellipse': jf_scen,
+        'zero':       [],
     }
  
     print('\nGrid: %d×%d cells, SX=%.4f m/cell, SY=%.4f m/cell' % (QX, QY, SX, SY))
+    print('JF formula      : directions=%d  angle_offset=%.1f deg  angle_step=%s  thresholds=%s'
+          % (JF_DIRECTIONS, JF_ANGLE_OFFSET,
+             ('equal-spacing (360/n)' if JF_ANGLE_STEP == 0 else '%.1f deg' % JF_ANGLE_STEP),
+             JF_THRESHOLDS.tolist()))
     print('Output: %s\n' % OUTPUT_DIR)
  
     n_events  = len(EVENTS)
