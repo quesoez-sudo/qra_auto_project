@@ -12,7 +12,7 @@ Pipeline
 3. Read PageControl  → active Impact IDs + destination ranges
 4. For each active Impact ID:
      a. Set Core!C2 = impact_id  →  force recalculation
-     b. Warn if Core!G2 has a size filter active (can hide scenarios)
+     b. Warn if Core!G2 hasIs  a size filter active (can hide scenarios)
      c. Read Core scenarios (A4:R89); skip sentinel rows (0 or -1)
      d. Read the corresponding effect results sheet with dynamic column matching
      e. Compute impact & risk matrices on the QY×QX grid
@@ -243,13 +243,6 @@ def print_params(p):
           f'[NOT from General sheet — verify with project team]')
     print(f'  Tox min prob    : {p["TOX_MIN_PROB"]}')
     print(f'  Thermal t_exp   : {p["THERM_T_EXP"]} s')
-    angle_step_label = ('equal-spacing (360/n)'
-                        if p["JF_ANGLE_STEP"] == 0
-                        else f'{p["JF_ANGLE_STEP"]} deg')
-    print(f'  JF directions   : {p["JF_DIRECTIONS"]}  '
-          f'offset={p["JF_ANGLE_OFFSET"]} deg  '
-          f'step={angle_step_label}')
-    print(f'  JF kW/m²        : {p["JF_THRESHOLDS"].tolist()}')
     print(sep + '\n')
 
 
