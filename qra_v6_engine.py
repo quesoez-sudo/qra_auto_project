@@ -220,7 +220,8 @@ def load_general_params(wb):
         'TOX_MIN_PROB':     float(tox[0]) if len(tox) > 0 else 0.01,
         'THERM_T_EXP':      float(t_exp)  if t_exp is not None else 20.0,
         'JF_THRESHOLDS':    np.array([1.6, 5.0, 7.3, 9.5, 12.5, 16.0, 20.9, 25.0, 30.0, 35.0]),
-        'JF_DIRECTIONS':    int(_fv(_GEN_JF_DIRS_RC)  or 8),
+        'JF_INDEX':         int(_fv(_GEN_JF_INDEX_RC)  or 8),
+        'JF_DIRECTIONS':    int(_fv(_GEN_JF_DIRS_RC)   or 8),
         'JF_ANGLE_OFFSET':  float(_fv(_GEN_JF_OFFSET_RC) or 0.0),
         'JF_ANGLE_STEP':    float(_fv(_GEN_JF_STEP_RC)   or 0.0),
     }
@@ -243,6 +244,14 @@ def print_params(p):
           f'[NOT from General sheet — verify with project team]')
     print(f'  Tox min prob    : {p["TOX_MIN_PROB"]}')
     print(f'  Thermal t_exp   : {p["THERM_T_EXP"]} s')
+    angle_step_label = ('equal-spacing (360/n)'
+                        if p['JF_ANGLE_STEP'] == 0
+                        else f'{p["JF_ANGLE_STEP"]} deg')
+    print(f'  JF index        : {p["JF_INDEX"]}  (General D22 — internal sequence count)')
+    print(f'  JF directions   : {p["JF_DIRECTIONS"]}  '
+          f'offset={p["JF_ANGLE_OFFSET"]} deg  '
+          f'step={angle_step_label}')
+    print(f'  JF kW/m²        : {p["JF_THRESHOLDS"].tolist()}')
     print(sep + '\n')
 
 
@@ -1092,6 +1101,13 @@ def main():
                 results_data = {
                     k: [{'dists': (td, tp), 'x': None, 'y': None}]
                     for k, (td, tp) in raw.items()
+                }
+
+            elif formula_type == 'jf_ellipse':
+                raw = read_jf_results(ws_res)
+                results_data = {
+                    k: [{'dist': v['dist'], 'halfW': v['halfW'], 'center': v['center']}]
+                    for k, v in raw.items()
                 }
 
             else:
