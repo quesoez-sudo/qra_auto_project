@@ -143,6 +143,29 @@ or does it reuse P_FF? If Core needs a new column, what is its name and how is i
 
 ---
 
+---
+
+## 11. Impact Zone Positional Shift (~5 cells in X and Y)
+
+**Status:** ⚠️ Accepted — not blocking, within QRA spatial uncertainty
+
+**Finding:** Impact zones computed by the Python engine appear shifted approximately 5 cells
+(~5.35 m) south and east of the source equipment location as seen on the facility map.
+Zone shape and magnitude are correct; only the absolute position is slightly off.
+
+**Root cause:** PHAST derives source coordinates from precise CAD/point geometry with
+sub-cell accuracy. Core stores a numeric approximation of those coordinates. Python then
+maps the Core value to the nearest grid cell centre (discrete snap), accumulating the
+positional error. Grid X/Y offsets in the Directions and General sheets are confirmed
+zero, so no systematic offset fix is possible from the workbook alone.
+
+**Magnitude:** ~5 cells × SX/SY ≈ 5.35 m on a 337 m × 339 m grid = ~1.6% positional error.
+
+**Decision:** Acceptable for QRA. Risk magnitudes are unaffected. Flag for reference;
+do not attempt a fix until the exact PHAST coordinate derivation method is known.
+
+---
+
 ## Summary Table
 
 | # | Topic | Status |
@@ -157,3 +180,4 @@ or does it reuse P_FF? If Core needs a new column, what is its name and how is i
 | 8 | Late Explosion formula/columns in ImpactFFMatrix | ⏸️ Deferred — zero output |
 | 9 | QY = 317 vs 318 (non-integer grid) | ⚠️ Minor |
 | 10 | Late Explosion probability column in Core | ⏸️ Deferred — zero output |
+| 11 | Impact zone positional shift ~5 cells in X and Y | ⚠️ Accepted — within QRA tolerance |
