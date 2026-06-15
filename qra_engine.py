@@ -52,7 +52,9 @@ EVENTS = [
 ]
  
 # ── Thermal formula constants ─────────────────────────────────────────────────
-# Radiation thresholds (kW/m²) → ImpactThermMatrix cols G-P (col indices 7-16)
+# Radiation thresholds (kW/m²) read dynamically from ImpactThermMatrix row-1 headers
+# (cols F-O = col indices 6-15).  The array below is a fallback used only when
+# read_thermal_scenarios() cannot find header values.
 THERM_THRESHOLDS = np.array([1.6, 5.0, 7.3, 9.5, 12.5, 16.0, 20.9, 25.0, 30.0, 35.0])
 THERM_T_EXP = 20.0   # exposure time [s], from AA8
  
@@ -79,8 +81,14 @@ JF_ANGLE_STEP  = 0      # 0 = equal spacing (360/n_dirs); >0 = fixed step [deg] 
  
 # ── Toxic formula constants ───────────────────────────────────────────────────
 TOX_MIN_PROB = 0.01   # AA15: minimum probability row to include from blob
- 
- 
+
+# ── Wind direction (dominant, from WindMatrix sheet) ─────────────────────────
+# Mathematical convention: 0° = East (+X), 90° = North (+Y).
+# Overwritten at runtime by read_wind_direction(); default = North.
+WIND_ANGLE_DEG = 90.0
+
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _safe_float(v):
     """Return float(v) or None for text / None values."""
@@ -139,8 +147,8 @@ def read_core(wb):
  
 def read_ff_scenarios(wb, core):
     """
-    ImpactFFMatrix columns: B=key, F=LFL_dist[m], G=LFL_frac_dist[m], H=X, I=Y.
-    X/Y taken from the sheet (cols H/I); probability from Core.
+    ImpactFFMatrix columns: B=path key, C=scenario name, E=LFL_dist[m], F=LFL_frac_dist[m].
+    X/Y fall back to Core coordinates.
     Skip rows not in Core.
     """
     ws = wb['ImpactFFMatrix']
@@ -149,12 +157,12 @@ def read_ff_scenarios(wb, core):
         key = ws.cell(r, 2).value
         if not key or key not in core:
             continue
-        lfl_d  = _safe_float(ws.cell(r, 6).value)   # col F
-        lflf_d = _safe_float(ws.cell(r, 7).value)   # col G
+        lfl_d  = _safe_float(ws.cell(r, 5).value)   # col E
+        lflf_d = _safe_float(ws.cell(r, 6).value)   # col F
         if lfl_d is None or lflf_d is None:
             continue
-        sx = _safe_float(ws.cell(r, 8).value) or core[key]['x']   # col H, fallback Core
-        sy = _safe_float(ws.cell(r, 9).value) or core[key]['y']   # col I
+        sx = core[key]['x']
+        sy = core[key]['y']
         scenarios.append(dict(
             key=key, sx=sx, sy=sy,
             lfl_dist=lfl_d, lflf_dist=lflf_d,
@@ -165,20 +173,32 @@ def read_ff_scenarios(wb, core):
  
 def read_thermal_scenarios(wb, core):
     """
-    ImpactThermMatrix columns: B=key, G-P=radiation distances[m] for 10 thresholds.
+    ImpactThermMatrix columns: B=key, F-O=radiation distances[m] for 10 thresholds.
+    Row-1 headers in cols F-O hold the kW/m² values (1.6, 5.0, … 35.0).
     Some distance cells may contain 'Not reached…' text → stored as None.
     """
     ws = wb['ImpactThermMatrix']
+    # Read kW/m² threshold values dynamically from row-1 headers (cols F-O = 6-15)
+    thresholds = []
+    for c in range(6, 16):
+        v = _safe_float(ws.cell(1, c).value)
+        if v is not None:
+            thresholds.append(v)
+    if not thresholds:
+        thresholds = THERM_THRESHOLDS.tolist()   # fallback to module constant
+    thresholds = np.array(thresholds)
+
     scenarios = []
     for r in range(2, ws.max_row + 1):
         key = ws.cell(r, 2).value
         if not key or key not in core:
             continue
-        dists = [_safe_float(ws.cell(r, c).value) for c in range(7, 17)]   # cols G-P
+        dists = [_safe_float(ws.cell(r, c).value) for c in range(6, 16)]   # cols F-O
         scenarios.append(dict(
             key=key,
             sx=core[key]['x'], sy=core[key]['y'],
             therm_dists=dists,
+            therm_thresholds=thresholds,
             size=core[key]['size'], probs=core[key]['probs'],
         ))
     return scenarios
@@ -281,8 +301,51 @@ def read_toxic_scenarios(wb, core):
 def dist_grid(sx, sy):
     """Euclidean distance (m) from point (sx, sy) to every grid cell → (QY, QX)."""
     return np.sqrt((XX - sx) ** 2 + (YY - sy) ** 2)
- 
- 
+
+
+def read_wind_direction(wb):
+    """
+    Read dominant wind direction from WindMatrix sheet.
+
+    WindMatrix layout:
+      Row 1 – direction names (W, WNW, NW, …)
+      Row 2 – angles in degrees (math convention: 0=East, 90=North)
+      Row 3 – Dia   (daytime) frequencies
+      Row 4 – Noche (nighttime) frequencies
+
+    Returns the angle (float, degrees) of the direction with the highest
+    combined Dia+Noche frequency.  Falls back to 90.0 (North) if the
+    sheet is absent or unreadable.
+    """
+    if 'WindMatrix' not in wb.sheetnames:
+        return 90.0
+    ws = wb['WindMatrix']
+    angles, totals = [], []
+    for c in range(3, ws.max_column + 1):
+        angle = _safe_float(ws.cell(2, c).value)
+        dia   = _safe_float(ws.cell(3, c).value) or 0.0
+        noche = _safe_float(ws.cell(4, c).value) or 0.0
+        if angle is not None:
+            angles.append(angle)
+            totals.append(dia + noche)
+    if not angles:
+        return 90.0
+    # WindMatrix angles are the direction FROM WHICH wind blows (meteorological FROM
+    # convention).  Add 180° to get the downwind direction (where the wind goes).
+    from_angle = float(angles[totals.index(max(totals))])
+    return (from_angle + 180.0) % 360.0
+
+
+def downwind_dist(sx, sy):
+    """
+    Signed downwind distance (m) from source (sx, sy) to every grid cell.
+    Positive = downwind of source, negative = upwind.
+    Uses WIND_ANGLE_DEG set by read_wind_direction().
+    """
+    angle_rad = np.radians(WIND_ANGLE_DEG)
+    return (XX - sx) * np.cos(angle_rad) + (YY - sy) * np.sin(angle_rad)
+
+
 def formula_ff(dist, lfl_dist, lflf_dist):
     """
     Flash Fire impact: step function on distance.
@@ -308,8 +371,10 @@ def formula_jf(sx, sy, dist_vals, halfW_vals, center_vals):
 
     Returns (QY, QX) array of kW/m² values (0.0 or one of JF_THRESHOLDS).
     """
-    x_rel = (XX - sx) / SX   # (QY, QX) cell-unit X offset from source
-    y_rel = (YY - sy) / SY   # (QY, QX) cell-unit Y offset from source
+    # Excel rounds cell-unit offsets to nearest integer (ROUND(...,0)).
+    # Match that behaviour so boundary cells agree with the kernel output.
+    x_rel = np.round((XX - sx) / SX)   # (QY, QX) integer cell-unit X offset
+    y_rel = np.round((YY - sy) / SY)   # (QY, QX) integer cell-unit Y offset
 
     if JF_ANGLE_STEP == 0:
         angles_deg = JF_ANGLE_OFFSET + np.arange(JF_DIRECTIONS) * 360.0 / JF_DIRECTIONS
@@ -355,95 +420,92 @@ def formula_jf(sx, sy, dist_vals, halfW_vals, center_vals):
     return result
 
 
-def formula_thermal(dist, therm_dists):
+def formula_thermal(dist, therm_dists, therm_thresholds=None):
     """
-    Thermal radiation impact: interpolate kW/m² from threshold distances,
-    apply probit equation, convert to probability via normal CDF.
- 
-    therm_dists: list of 10 values (may contain None) for thresholds [1.6..35 kW/m²].
-    Distances are for decreasing distance as threshold increases (G=farthest, P=closest).
- 
-    Returns (QY, QX) probability array in [0, 1].
+    Thermal radiation impact: return kW/m² at each grid cell.
+
+    Pool fires (LPF/EPF/FB) radiate omnidirectionally — dist must be the
+    Euclidean distance from the source (dist_grid), NOT a downwind projection.
+
+    dist             – radial distance grid (m) from source; always ≥ 0.
+    therm_dists      – list of radii (m) for each kW/m² threshold (may be None).
+    therm_thresholds – 1-D array of kW/m² values matching therm_dists order.
+                       Defaults to module-level THERM_THRESHOLDS if not supplied.
+
+    Returns (QY, QX) array of kW/m² (0.0 outside all thresholds).
     """
-    # Collect valid (kW, distance) pairs where distance > 0
+    if therm_thresholds is None:
+        therm_thresholds = THERM_THRESHOLDS
+
     valid_idx = [i for i, d in enumerate(therm_dists) if d is not None and d > 0]
     if not valid_idx:
         return np.zeros(dist.shape)
- 
-    kw_vals   = THERM_THRESHOLDS[valid_idx]           # ascending kW
-    dist_vals = np.array([therm_dists[i] for i in valid_idx])  # descending dist
- 
-    # np.interp requires xp ascending → flip so small dist (high kW) comes first
-    xp = dist_vals[::-1]   # ascending distances
-    fp = kw_vals[::-1]     # descending kW (high kW at small dist)
- 
-    kw_at_cell = np.interp(
+
+    kw_vals   = np.asarray(therm_thresholds)[valid_idx]
+    dist_vals = np.array([therm_dists[i] for i in valid_idx])
+
+    xp = dist_vals[::-1]   # ascending distances (small dist = high kW first)
+    fp = kw_vals[::-1]     # descending kW
+
+    return np.interp(
         dist, xp, fp,
-        left=fp[0],    # dist < min_threshold_dist → cap at max kW
-        right=0.0      # dist > max_threshold_dist → kW ~ 0
+        left=fp[0],    # inside innermost threshold → cap at max kW/m²
+        right=0.0      # beyond outermost threshold → 0
     )
- 
-    # Apply probit only where kW > 0
-    result = np.zeros(dist.shape)
-    mask = kw_at_cell > 0.0
-    if np.any(mask):
-        kw = kw_at_cell[mask]
-        certain = kw >= THERM_THRESHOLDS[-1]
-        probit = -36.38 + 2.56 * np.log((1000.0 * kw) ** (4.0 / 3.0) * THERM_T_EXP)
-        p = np.clip(_norm_cdf(probit - 5.0), 0.0, 1.0)
-        p[certain] = 1.0
-        result[mask] = p
- 
-    return result
  
  
 def formula_explosion(dist, exp_dists):
     """
-    Explosion overpressure impact: interpolate bar from threshold distances,
-    apply step function (limitOV2 = 0.3 bar → impact 0 or 1).
- 
-    exp_dists: list of 5 values for thresholds [0.04, 0.1, 0.35, 0.5, 1.0 bar].
-    Distances are descending as threshold increases (J=farthest, N=closest).
- 
-    Returns (QY, QX) array with values 0.0 or EXP_LIM_F2 (1.0).
+    Explosion overpressure impact: interpolate bar pressure from threshold distances.
+
+    Matches Excel's ImpactExpMatrix AB kernel (impact mode):
+      impactM = linear interp(dist -> bar) using distV=cols J-N, impactV=[0.04..1.0 bar]
+      - dist > MAX(distV) -> 0 bar
+      - dist < MIN(distV) -> highest bar threshold (~1.0 bar)
+      - otherwise         -> linearly interpolated bar pressure
+
+    exp_dists: list of 5 values [dist_0.04bar, dist_0.1bar, dist_0.35bar, dist_0.5bar, dist_1.0bar].
+    Distances are descending (J=farthest/lowest bar, N=closest/highest bar).
+
+    Returns (QY, QX) array of bar pressure (0.0 to ~1.0).
     """
     valid_idx = [i for i, d in enumerate(exp_dists) if d is not None and d > 0]
     if not valid_idx:
         return np.zeros(dist.shape)
- 
+
     bar_vals  = EXP_THRESHOLDS[valid_idx]
     dist_vals = np.array([exp_dists[i] for i in valid_idx])
- 
-    xp = dist_vals[::-1]   # ascending distances
-    fp = bar_vals[::-1]    # descending bar (high bar at small dist)
- 
-    bar_at_cell = np.interp(
-        dist, xp, fp,
-        left=fp[0],    # dist < min → max bar
-        right=0.0      # dist > max → bar ~ 0
-    )
- 
-    # Step function: impact = 1 if bar >= limitOV2 (0.3), else 0
-    result = np.where(bar_at_cell >= EXP_LIM_OV2, EXP_LIM_F2,
-             np.where(bar_at_cell >= EXP_LIM_OV1, EXP_LIM_F1, 0.0))
-    return result
+
+    xp = dist_vals[::-1]   # ascending distances (small dist = high pressure)
+    fp = bar_vals[::-1]    # descending bar
+
+    return np.interp(dist, xp, fp, left=fp[0], right=0.0)
  
  
 def formula_toxic(dist, tox_dists, tox_probs):
     """
-    Toxic impact: interpolate probability from distance-probability profile.
- 
-    tox_dists: 1D array ascending distances [m] (already filtered >= 0, prob >= 0.01).
-    tox_probs: matching probability values.
- 
+    Toxic impact: interpolate fatality probability from the dispersion profile.
+
+    The toxic cloud disperses radially (Excel uses a circle centred at the
+    source), so dist must be the Euclidean distance from the source
+    (dist_grid), NOT a signed downwind projection.
+
+    dist      – radial distance grid (m); always ≥ 0 when using dist_grid.
+    tox_dists – 1D ascending distances [m] where prob ≥ TOX_MIN_PROB.
+    tox_probs – matching probability values.
+
+    left = tox_probs[0]: cells closer than the first blob entry inherit the
+    threshold probability (fills the centre of the circle instead of leaving
+    a zero-probability hole caused by the blob's near-source dilution zone).
+
     Returns (QY, QX) probability array in [0, 1].
     """
     if len(tox_dists) == 0:
         return np.zeros(dist.shape)
     result = np.interp(
         dist, tox_dists, tox_probs,
-        left=1.0,             # very close → certain fatality (matches Excel)
-        right=0.0             # beyond max distance → 0
+        left=tox_probs[0],   # inside innermost entry → extend threshold prob inward
+        right=0.0             # beyond max radius → 0
     )
     return np.clip(result, 0.0, 1.0)
  
@@ -480,18 +542,30 @@ def run_event(event, scenarios):
             sx, sy = sc['ign_x'], sc['ign_y']
         else:
             sx, sy = sc['sx'], sc['sy']
- 
+
+        # ── Distance grid ──────────────────────────────────────────────────────
+        # All consequence radii (toxic, thermal, ff, explosion) are measured
+        # from the source/ignition point and applied as RADIAL distances:
+        #
+        #   toxic   – circle centred at source; formula_toxic uses dist_grid.
+        #   thermal – omnidirectional pool/fireball radiation; dist_grid.
+        #   ff      – LFL circle centred at source; dist_grid.
+        #   explosion – radial overpressure from ignition point; dist_grid.
+        #   jf_ellipse – handled inside formula_jf (directional ellipses).
+        #
+        # downwind_dist() is retained for any future directional model but is
+        # not used in the standard event dispatch below.
         d = dist_grid(sx, sy)
- 
+
         # Compute impact for this scenario
-        if formula == 'ff':
-            cell_imp = formula_ff(d, sc['lfl_dist'], sc['lflf_dist'])
-        elif formula == 'thermal':
-            cell_imp = formula_thermal(d, sc['therm_dists'])
+        if formula == 'thermal':
+            cell_imp = formula_thermal(d, sc['therm_dists'], sc['therm_thresholds'])
         elif formula == 'explosion':
             cell_imp = formula_explosion(d, sc['exp_dists'])
         elif formula == 'toxic':
             cell_imp = formula_toxic(d, sc['tox_dists'], sc['tox_probs'])
+        elif formula == 'ff':
+            cell_imp = formula_ff(d, sc['lfl_dist'], sc['lflf_dist'])
         elif formula == 'jf_ellipse':
             cell_imp = formula_jf(sx, sy, sc['dist_vals'], sc['halfW_vals'], sc['center_vals'])
         else:
@@ -641,7 +715,12 @@ def main():
  
     print('Loading workbook: %s' % EXCEL_PATH)
     wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
- 
+
+    global WIND_ANGLE_DEG
+    WIND_ANGLE_DEG = read_wind_direction(wb)
+    print('Wind direction  : %.1f° (math convention: 0=E, 90=N) from WindMatrix'
+          % WIND_ANGLE_DEG)
+
     print('Reading Core sheet...')
     core = read_core(wb)
     print('  %d scenarios with coordinates loaded from Core.' % len(core))
