@@ -73,16 +73,9 @@ _THERM_DOE         =   4.0 / 3.0   # thermal dose exponent
 _THERM_PROBIT_MEAN =   5.0          # probit centre (standard 50 % point)
 _THERM_KW_SCALE    = 1000.0         # kW → W conversion inside probit argument
 
-# ── Explosion step-function fatality thresholds ───────────────────────────────
-# These are NOT in the General sheet (they come from the ImpactExpMatrix AA column
-# of the original KernelV0).  They are kept here as named constants.
-# _EXP_FATAL_BAR : overpressure (bar) at and above which fatality factor = 1
-# _EXP_LOW_BAR   : overpressure (bar) below which fatality factor = 0
-# NOTE: verify these values with the project team before accepting results.
-_EXP_LOW_BAR    = 0.1   # limitOV1
-_EXP_FATAL_BAR  = 0.3   # limitOV2
-_EXP_F_MID      = 0.0   # fatality factor between _EXP_LOW_BAR and _EXP_FATAL_BAR
-_EXP_F_FATAL    = 1.0   # fatality factor at or above _EXP_FATAL_BAR
+# (CVE risk thresholds and probabilities are derived from EXP_THRESHOLDS at runtime;
+#  see _explosion_risk_prob().  Confirmed from ImpactExpMatrix AA15–AA18:
+#  limit1=0.04 bar, limit2=0.1 bar, prob_mid=0.35, prob_high=0.5.)
 
 # ── Sheet and size labels ─────────────────────────────────────────────────────
 SHEET_IMPACT = 'Impact Matrix Result'
@@ -240,8 +233,9 @@ def print_params(p):
     print(f'  FF zone values  : outside={p["FF_OUTSIDE"]}  '
           f'transition={p["FF_TRANSITION"]}  inside={p["FF_INSIDE_LFL"]}')
     print(f'  Overpressure bar: {p["EXP_THRESHOLDS"].tolist()}')
-    print(f'  Exp fatal limit : >= {_EXP_FATAL_BAR} bar  '
-          f'[NOT from General sheet — verify with project team]')
+    thr = p['EXP_THRESHOLDS']
+    print(f'  CVE risk zones  : <{thr[0]}→0  [{thr[0]},{thr[1]})→{thr[2]}  '
+          f'>={thr[1]}→{thr[3]}  (from EXP_THRESHOLDS AA15-AA18)')
     print(f'  Tox min prob    : {p["TOX_MIN_PROB"]}')
     print(f'  Thermal t_exp   : {p["THERM_T_EXP"]} s')
     angle_step_label = ('equal-spacing (360/n)'
@@ -283,8 +277,9 @@ def formula_jf(sx, sy, dist_vals, halfW_vals, center_vals):
     offset      = _P['JF_ANGLE_OFFSET']
     step        = _P['JF_ANGLE_STEP']
 
-    x_rel = (XX - sx) / SX   # (QY, QX) cell-unit X offset from source
-    y_rel = (YY - sy) / SY   # (QY, QX) cell-unit Y offset from source
+    # Excel uses ROUND(..., 0) for cell-unit offsets — match integer rounding
+    x_rel = np.round((XX - sx) / SX)   # (QY, QX) integer cell-unit X offset
+    y_rel = np.round((YY - sy) / SY)   # (QY, QX) integer cell-unit Y offset
 
     if step == 0:
         angles_deg = offset + np.arange(n_dirs) * 360.0 / n_dirs
@@ -330,25 +325,37 @@ def formula_jf(sx, sy, dist_vals, halfW_vals, center_vals):
 
 
 def formula_thermal(dist, therm_dists):
-    """Thermal radiation: interpolate kW/m², apply probit, return P_fatality.
+    """Thermal radiation: interpolate kW/m² from threshold distances.
+
+    Returns (QY, QX) array of kW/m² values matching Excel impact mode (AA2=0).
+    Call _thermal_risk_prob() on the result to get P_fatality for the risk matrix.
 
     therm_dists : list aligned with _P['THERM_THRESHOLDS']; None where not computed.
     """
     thresholds = _P['THERM_THRESHOLDS']
-    t_exp      = _P['THERM_T_EXP']
     valid      = [(i, d) for i, d in enumerate(therm_dists) if d is not None and d > 0]
     if not valid:
         return np.zeros(dist.shape)
 
-    kw_v  = thresholds[[i for i, _ in valid]]
-    d_v   = np.array([d for _, d in valid])
+    kw_v = thresholds[[i for i, _ in valid]]
+    d_v  = np.array([d for _, d in valid])
+    return np.interp(dist, d_v[::-1], kw_v[::-1], left=kw_v[::-1][0], right=0.0)
 
-    kw_at = np.interp(dist, d_v[::-1], kw_v[::-1], left=kw_v[::-1][0], right=0.0)
-    result = np.zeros(dist.shape)
-    mask   = kw_at > 0.0
+
+def _thermal_risk_prob(kw_mat):
+    """Convert kW/m² matrix → P_fatality via probit model.
+
+    Matches Excel riskT: freq × Φ(probit − 5)
+    where probit = PA + PB × ln((scale × kW)^DOE × t_exp).
+    Confirmed from ImpactThermMatrix AB1 formula (risk mode, AA2=1).
+    """
+    thresholds = _P['THERM_THRESHOLDS']
+    t_exp      = _P['THERM_T_EXP']
+    result = np.zeros(kw_mat.shape)
+    mask   = kw_mat > 0.0
     if np.any(mask):
-        kw      = kw_at[mask]
-        certain = kw >= thresholds[-1]        # at or above max threshold → certain death
+        kw      = kw_mat[mask]
+        certain = kw >= thresholds[-1]
         probit  = (_THERM_PA
                    + _THERM_PB * np.log((_THERM_KW_SCALE * kw) ** _THERM_DOE * t_exp))
         p = np.clip(_norm_cdf(probit - _THERM_PROBIT_MEAN), 0.0, 1.0)
@@ -358,24 +365,43 @@ def formula_thermal(dist, therm_dists):
 
 
 def formula_explosion(dist, exp_dists):
-    """Overpressure: interpolate bar, apply step-function fatality factor.
+    """Overpressure: interpolate bar pressure from threshold distances.
+
+    Matches Excel ImpactExpMatrix AB1 impact mode (AA2=0):
+      linear interp(dist → bar) where distV=cols J–N, impactV=[0.04,0.1,0.35,0.5,1.0].
+      dist > MAX(distV) → 0 bar;  dist < MIN(distV) → highest bar threshold.
 
     exp_dists : list aligned with _P['EXP_THRESHOLDS']; None where not computed.
-    Returns 0.0 or _EXP_F_FATAL per cell.
+    Returns (QY, QX) array of bar pressure (0.0 to 1.0 bar).
+    Call _explosion_risk_prob() on the result to get fatality probability for risk matrix.
     """
     thresholds = _P['EXP_THRESHOLDS']
     valid      = [(i, d) for i, d in enumerate(exp_dists) if d is not None and d > 0]
     if not valid:
         return np.zeros(dist.shape)
 
-    bar_v  = thresholds[[i for i, _ in valid]]
-    d_v    = np.array([d for _, d in valid])
-    bar_at = np.interp(dist, d_v[::-1], bar_v[::-1], left=bar_v[::-1][0], right=0.0)
+    bar_v = thresholds[[i for i, _ in valid]]
+    d_v   = np.array([d for _, d in valid])
+    return np.interp(dist, d_v[::-1], bar_v[::-1], left=bar_v[::-1][0], right=0.0)
 
-    return np.where(
-        bar_at >= _EXP_FATAL_BAR, _EXP_F_FATAL,
-        np.where(bar_at >= _EXP_LOW_BAR, _EXP_F_MID, 0.0)
-    )
+
+def _explosion_risk_prob(bar_mat):
+    """Convert bar pressure matrix → fatality probability for risk matrix.
+
+    Matches Excel riskCVE: IF(bar<limit1, 0, IF(bar<limit2, limit3, limit4))
+    Derived from EXP_THRESHOLDS=[0.04, 0.1, 0.35, 0.5, 1.0]:
+      bar < 0.04             → 0
+      0.04 ≤ bar < 0.1       → 0.35
+      bar ≥ 0.1              → 0.5
+    Confirmed from ImpactExpMatrix AA15–AA18 control cells.
+    """
+    thr    = _P['EXP_THRESHOLDS']
+    limit1 = thr[0]                           # 0.04 bar
+    limit2 = thr[1]                           # 0.10 bar
+    prob1  = thr[2] if len(thr) > 2 else 0.0  # 0.35
+    prob2  = thr[3] if len(thr) > 3 else 1.0  # 0.50
+    return np.where(bar_mat >= limit2, prob2,
+           np.where(bar_mat >= limit1, prob1, 0.0))
 
 
 def formula_ff(dist, lfl_dist, lflf_dist):
@@ -808,20 +834,25 @@ def compute_event(formula_type, prob_idx, scenarios, results_data, is_cve=False)
 
             if formula_type == 'thermal':
                 cell_imp = formula_thermal(d, entry['dists'])
+                risk_c   = _thermal_risk_prob(cell_imp) * prob
             elif formula_type == 'explosion':
                 cell_imp = formula_explosion(d, entry['dists'])
+                risk_c   = _explosion_risk_prob(cell_imp) * prob
             elif formula_type == 'ff':
                 lfl_dist, lflf_dist = entry['dists']
                 cell_imp = formula_ff(d, lfl_dist, lflf_dist)
+                # Excel riskFF: IF(zone==2, 1, 0) × freq  — only inside-LFL cells are fatal
+                risk_c   = np.where(cell_imp >= _P['FF_INSIDE_LFL'], 1.0, 0.0) * prob
             elif formula_type == 'toxic':
                 tox_d, tox_p = entry['dists']
                 cell_imp = formula_toxic(d, tox_d, tox_p)
+                risk_c   = cell_imp * prob
             elif formula_type == 'jf_ellipse':
                 cell_imp = formula_jf(sx, sy, entry['dist'], entry['halfW'], entry['center'])
+                # JF is thermal: apply probit to kW/m² for risk, store kW for impact
+                risk_c   = _thermal_risk_prob(cell_imp) * prob
             else:
                 continue
-
-            risk_c = cell_imp * prob
 
             impact_mats['Total'] += cell_imp
             risk_mats['Total']   += risk_c
