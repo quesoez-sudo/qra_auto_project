@@ -1,6 +1,6 @@
 # QRA Engine — Formula Reference
 
-This document describes the four implemented event types in `qra_engine_v2.py`. For each event it covers:
+This document describes the five implemented event types in `qra_engine_v2.py`. For each event it covers:
 1. The **Excel kernel formula** (from `KernelV0_v2_copy.xlsx`) and what every parameter means.
 2. The **Python implementation** in the engine and the role of each argument.
 3. The **physical/engineering formula** that both of the above are expressing.
@@ -461,13 +461,185 @@ The jet fire radiation probit is identical to the pool fire probit (Eisenberg mo
 
 ---
 
+## 5. Explosion — `exp`
+
+**Applies to event:** CVE (Confined Vapour Cloud Explosion)
+
+---
+
+### 5.1 Excel Formula — `ImpactExpMatrix!AB1`
+
+```excel
+IFERROR(
+  LET(
+    area,    ANCHOR:INDEX(ANCHOR_F, AA16, AA15),
+
+    distM,   MAP(area, LAMBDA(n,
+               SQRT((AA13*(COLUMN(n)-0.5) - AA5)^2
+                  + (AA14*((ROWS(area)-ROW(n))+0.5) - AA6)^2))),
+
+    distV,   INDEX(R:V, MATCH(AA3, B:B, 0),),
+    impactV, R1:V1,
+
+    matchM,  MAP(distM, LAMBDA(n, MATCH(n, distV, -1))),
+
+    impactM, MAP(matchM, distM, LAMBDA(y, d,
+               IF(d > MAX(distV), 0,
+                  IF(d < MIN(distV), 1,
+                     (INDEX(impactV, y+1) - INDEX(impactV, y))
+                     / (INDEX(distV,  y+1) - INDEX(distV,  y))
+                     * (d - INDEX(distV, y)) + INDEX(impactV, y))))),
+
+    riskCVE, MAP(impactM, LAMBDA(k,
+               IFERROR(
+                 IF(k < AA17, 0,
+                    IF(k < AA18, AA7 * AA19,
+                                 AA7 * AA20)),
+                 0))),
+
+    IF(AA2 = 0, impactM, riskCVE)
+  ),
+-1)
+```
+
+**Parameter reference:**
+
+| Cell | Name | Description |
+|------|------|-------------|
+| `AA2` | mode | `0` = impact matrix; `1` = risk matrix |
+| `AA3` | scenario key | Matched against col B to select the active row |
+| `AA5` | Xign | **Ignition point** X coordinate in metres (col K of matched row) — NOT the release-point X from Core |
+| `AA6` | Yign | **Ignition point** Y coordinate in metres (col L of matched row) |
+| `AA7` | frequency | P_CVE from Core (events/year) |
+| `AA13` | SX | Grid cell width (m/cell) |
+| `AA14` | SY | Grid cell height (m/cell) |
+| `AA15` | QX | Number of grid columns (315) |
+| `AA16` | QY | Number of grid rows (317) |
+| `AA17` | risk_lo | Lower overpressure limit for risk contribution (0.1 bar in current kernel) |
+| `AA18` | risk_hi | Upper overpressure limit (0.3 bar in current kernel) |
+| `AA19` | risk_factor_mid | Risk multiplier when `risk_lo ≤ impact < risk_hi` (1 in current kernel) |
+| `AA20` | risk_factor_high | Risk multiplier when `impact ≥ risk_hi` — currently `None` → IFERROR → 0 |
+| `R:V` | distV | 5 ascending distances (m) per scenario row at which overpressure drops to each threshold (from PHAST, NOT hardcoded) |
+| `R1:V1` | impactV | 5 overpressure threshold values in bar (row 1 headers, from PHAST, NOT hardcoded) |
+
+> **Critical coordinate distinction:** `AA5`/`AA6` are the **ignition point** coordinates (Xign, Yign), read from cols K/L of the matched `ImpactExpMatrix` row. They are NOT the release-source coordinates (X/Y) from the Core sheet. For a CVE, the explosion originates at the point of ignition of the vapour cloud, which may be displaced from the release location.
+
+---
+
+### 5.2 Effective Formula Behaviour — Why it degenerates to a step function
+
+The formula appears to implement a linear interpolation between 5 overpressure thresholds (identical in structure to the thermal formula). However, in practice it reduces to a **pure step function**.
+
+**Root cause:** `MATCH(d, distV, -1)` uses match-type `-1`, which requires a **descending** array. The 5 distances in cols R–V are stored in **ascending** order (from PHAST: shortest → farthest distance as overpressure decreases). When Excel sees an ascending array with match-type −1, it cannot find a valid bracket for any `d ≥ min(distV)` → returns `#N/A` → caught by the outer `IFERROR` → **0**.
+
+Only cells where `d < min(distV)` (inside the tightest threshold radius) are handled by the `IF(d < MIN(distV), 1, ...)` branch, returning **1.0** unconditionally.
+
+**Effective rule:**
+
+$$\text{Impact}(d) = \begin{cases} 1.0 & d < \min(\text{distV}) \\ 0.0 & d \geq \min(\text{distV}) \end{cases}$$
+
+This was confirmed by kernel comparison: 100% cell-level match across all CVE scenarios.
+
+---
+
+### 5.3 Python Implementation — `qra_engine_v2.compute_exp`
+
+```python
+def compute_exp(dist_m, distances, impact_v, return_risk=False, frequency=1.0,
+                risk_lo=0.1, risk_hi=0.3):
+    """
+    Explosion (CVE) impact / risk formula (mirrors ImpactExpMatrix AB1).
+
+    dist_m    : (QY, QX) distance array in metres from the ignition point (Xign, Yign)
+    distances : 5 ascending distances (m) from cols R-V of the matched scenario row
+    impact_v  : 5 bar threshold values from row 1 cols R-V (read dynamically from sheet)
+    """
+    dv = np.array([float(x) if x not in ('', None) else np.nan for x in distances])
+    valid = ~np.isnan(dv) & (dv > 0)
+    dv_v  = dv[valid]
+    if len(dv_v) == 0:
+        return np.zeros_like(dist_m, dtype=float)
+
+    threshold = float(np.min(dv_v))   # radius of the innermost (highest pressure) zone
+
+    impact = np.zeros_like(dist_m, dtype=float)
+    impact[dist_m < threshold] = 1.0  # step function: inside → 1, outside → 0
+
+    if return_risk:
+        risk = np.zeros_like(impact, dtype=float)
+        risk[(impact >= risk_lo) & (impact < risk_hi)] = frequency
+        return risk
+    return impact
+```
+
+**`read_exp` — how the scenario data is loaded:**
+
+```python
+def read_exp(ws):
+    impact_v = [_flt(_v(ws, 1, c)) for c in ['R', 'S', 'T', 'U', 'V']]  # row 1 = bar thresholds
+    scenarios = []
+    for r in range(2, ws.max_row + 1):
+        b = _v(ws, r, 'B')
+        if not b:
+            break
+        scenarios.append({
+            'path_code': str(b),
+            'xign':      _flt(_v(ws, r, 'K')),   # ignition X — NOT Core X
+            'yign':      _flt(_v(ws, r, 'L')),   # ignition Y — NOT Core Y
+            'distances': [_flt(_v(ws, r, c)) for c in ['R', 'S', 'T', 'U', 'V']],
+            'impact_v':  impact_v,                # same row-1 header for all rows
+        })
+    return scenarios
+```
+
+**Argument reference:**
+
+| Argument | Description |
+|----------|-------------|
+| `dist_m` | `(QY, QX)` Euclidean distance from the **ignition point** (Xign, Yign) in metres |
+| `distances` | 5-element list — ascending distances (m) at which overpressure drops to each threshold (cols R–V of the matched row, from PHAST) |
+| `impact_v` | 5-element list — overpressure threshold values in bar (row 1 of cols R–V); read dynamically, NOT hardcoded |
+| `risk_lo` | Lower overpressure limit for risk accumulation (0.1 bar, from `ImpactExpMatrix AA17`) |
+| `risk_hi` | Upper overpressure limit (0.3 bar, from `ImpactExpMatrix AA18`) |
+| `frequency` | P_CVE from Core sheet (events/year) |
+| `return_risk` | If True, returns risk matrix instead of impact matrix |
+
+---
+
+### 5.4 Physical Formula
+
+A confined vapour cloud explosion (CVE) generates an overpressure blast wave. Structural damage and fatality depend on peak overpressure at a given distance.
+
+**Step 1 — Overpressure at distance d:**
+
+The consequence model (PHAST/SAFETI) provides pairs `(distance, overpressure)` for each scenario, stored as the ascending `distV` / `impactV` tables. In principle:
+
+$$\Delta P(d) = \text{interpolate from } \{(d_i, \Delta P_i)\}$$
+
+In this kernel's current implementation the MATCH(-1) issue reduces this to a binary field — see §5.2.
+
+**Step 2 — Risk step function:**
+
+Rather than a probit model, CVE risk uses a threshold model based on two overpressure limits confirmed from `ImpactExpMatrix AA17–AA18`:
+
+$$IR = f_{CVE} \times \begin{cases} 0 & \Delta P < \Delta P_{lo} \quad (\text{AA17} = 0.1 \text{ bar}) \\ k_{mid} & \Delta P_{lo} \leq \Delta P < \Delta P_{hi} \quad (\text{AA19}) \\ k_{high} & \Delta P \geq \Delta P_{hi} \quad (\text{AA20, currently} \to 0) \end{cases}$$
+
+where `k_mid` = AA19 (currently 1) and `k_high` = AA20 (currently None → IFERROR → 0).
+
+**Why Xign ≠ Core X:**
+
+In a CVE scenario the flammable cloud drifts downwind from the release point before ignition. The explosion epicentre is therefore at the ignition point, not the release location. `ImpactExpMatrix` cols K/L store Xign/Yign from the dispersion model, and all grid distances are computed from this ignition point.
+
+---
+
 ## Summary Table
 
-| Event | Impact output | Risk conversion | Source of geometry |
-|-------|--------------|-----------------|-------------------|
-| Thermal (LPF/EPF/FB) | kW/m² via linear interp from 10 radial isopleths | Eisenberg probit → × frequency | Circular isopleths from consequence model |
-| Flash Fire (FF) | 0 / 1 / 2 zone indicator | 1 inside LFL × frequency | Two radii (LFL, LFLF) from dispersion model |
-| Toxic | Lethality probability (0–1) via interp from blob | Direct × frequency (no extra probit) | Distance–probability table from dispersion model |
-| Jet Fire (JF) | kW/m² from maximum over 8 rotated ellipses | Eisenberg probit → × frequency | Ellipse params (tip, half-width, centre) per kW level from flame model |
+| Event | Impact output | Risk conversion | Source geometry | Coordinates |
+|-------|--------------|-----------------|-----------------|-------------|
+| Thermal (LPF/EPF/FB) | kW/m² via linear interp from 10 radial isopleths | Eisenberg probit → × frequency | Circular isopleths from consequence model | Core X/Y |
+| Flash Fire (FF) | 0 / 1 / 2 zone indicator | 1 inside LFL × frequency | Two radii (LFL, LFLF) from dispersion model | Core X/Y |
+| Toxic | Lethality probability (0–1) via interp from blob | Direct × frequency (no extra probit) | Distance–probability table from dispersion model | Core X/Y |
+| Jet Fire (JF) | kW/m² from maximum over 8 rotated ellipses | Eisenberg probit → × frequency | Ellipse params (tip, half-width, centre) per kW level from flame model | Core X/Y |
+| Explosion (CVE) | 1.0 inside ignition radius, 0.0 outside (step function) | Threshold model (AA17/AA18) × frequency | 5 overpressure radii from PHAST (distV ascending, degenerate to step) | **Xign/Yign** (cols K/L — ignition point, NOT Core X/Y) |
 
 All individual risk outputs share the same unit: **annual probability of fatality** (dimensionless, typically 10⁻⁶ to 10⁻³ range) and are accumulated across scenarios to build the total risk matrices.
