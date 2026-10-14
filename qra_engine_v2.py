@@ -316,6 +316,49 @@ def compute_jf(x_c, y_c,
     return impact
 
 
+# ── EXPLOSION (CVE) ───────────────────────────────────────────────────────────
+def compute_exp(dist_m, distances, impact_v, return_risk=False, frequency=1.0,
+                risk_lo=0.1, risk_hi=0.3):
+    """
+    Explosion (CVE) impact/risk formula (mirrors ImpactExpMatrix AB1).
+
+    dist_m    : (QY, QX) distances in metres from ignition point (Xign, Yign)
+    distances : 5 values (cols R-V per scenario row) — ascending distances (m) at
+                which overpressure equals the corresponding impact_v thresholds.
+                Zero or NaN entries are excluded.
+    impact_v  : 5 threshold values read from row 1 cols R-V of the sheet (from PHAST,
+                NOT hardcoded). Paired with distances for interpolation intent.
+
+    Effective behaviour (step function):
+      The Excel formula calls MATCH(d, distV, -1) where distV is in ASCENDING order,
+      but match_type=-1 expects DESCENDING. When given ascending distV, MATCH(-1)
+      treats the first (smallest) element as the "maximum" of the array. Any d >=
+      min(distV) causes MATCH to return #N/A, which the outer IFERROR catches → 0.
+      Only d < min(distV) is handled by the inner IF branch → 1.0.
+      Result: impact = 1.0 inside the first distance threshold, 0 everywhere else.
+
+    Risk:   step function on the impact value driven by AA17-AA21 limits (not impact_v).
+    """
+    dv = np.array([float(x) if x not in ('', None) else np.nan for x in distances])
+    valid = ~np.isnan(dv) & (dv > 0)
+    dv_v = dv[valid]
+
+    if len(dv_v) == 0:
+        return np.zeros_like(dist_m, dtype=float)
+
+    # Step function: 1.0 inside the minimum (first) distance threshold, 0 outside.
+    # This mirrors the MATCH(-1)-on-ascending-array failure in the Excel formula.
+    threshold = float(np.min(dv_v))
+    impact = np.zeros_like(dist_m, dtype=float)
+    impact[dist_m < threshold] = 1.0
+
+    if return_risk:
+        risk = np.zeros_like(impact, dtype=float)
+        risk[(impact >= risk_lo) & (impact < risk_hi)] = frequency
+        return risk
+    return impact
+
+
 # ── Sheet readers ─────────────────────────────────────────────────────────────
 def _col(letter):
     """Column letter(s) -> 1-based column index."""
@@ -381,6 +424,27 @@ def read_tox(ws):
             'scenario':  str(_v(ws, r, 'C')),
             'weather':   str(_v(ws, r, 'D')),
             'blob':      str(blob) if blob else '',
+        })
+    return scenarios
+
+
+def read_exp(ws):
+    # Row 1 cols R-V: impact threshold values (from PHAST — not hardcoded).
+    impact_v = [_flt(_v(ws, 1, c)) for c in ['R', 'S', 'T', 'U', 'V']]
+    scenarios = []
+    for r in range(2, ws.max_row + 1):
+        b = _v(ws, r, 'B')
+        if not b:
+            break
+        scenarios.append({
+            'path_code': str(b),
+            'scenario':  str(_v(ws, r, 'C')),
+            'weather':   str(_v(ws, r, 'D')),
+            'location':  str(_v(ws, r, 'G')),
+            'xign':      _flt(_v(ws, r, 'K')),
+            'yign':      _flt(_v(ws, r, 'L')),
+            'distances': [_flt(_v(ws, r, c)) for c in ['R', 'S', 'T', 'U', 'V']],
+            'impact_v':  impact_v,
         })
     return scenarios
 
@@ -518,10 +582,11 @@ def main():
     core = load_core()   # reads CORE_FILE / CORE_SHEET constants at top
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    for d in ('thermal', 'thermal_risk', 'ff', 'ff_risk', 'toxic', 'toxic_risk', 'jf', 'jf_risk'):
+    for d in ('thermal', 'thermal_risk', 'ff', 'ff_risk', 'toxic', 'toxic_risk', 'jf', 'jf_risk',
+              'exp', 'exp_risk'):
         (OUTPUT_DIR / d).mkdir(exist_ok=True)
 
-    n_missing = {'thermal': 0, 'ff': 0, 'toxic': 0, 'jf': 0}
+    n_missing = {'thermal': 0, 'ff': 0, 'toxic': 0, 'jf': 0, 'exp': 0}
 
     # ── THERMAL ──────────────────────────────────────────────────────────────
     print("\n=== THERMAL (P_LPF from Core) ===")
@@ -684,6 +749,74 @@ def main():
     )
     print(f"  -> output_v2/toxic  ({len(summary)} written, {n_missing['toxic']} skipped)")
 
+    # ── EXPLOSION (CVE) ───────────────────────────────────────────────────────
+    # Source coords are Xign/Yign from col K/L of each row (NOT from Core).
+    # Frequency (P_CVE) still comes from Core.
+    # The kernel formula uses MATCH(AA3, B:B, 0) = first row per unique key.
+    # We generate one CSV per unique key (first matching row) to match kernel behaviour.
+    print("\n=== EXPLOSION (P_CVE from Core, coords from Xign/Yign) ===")
+    scenarios = read_exp(wb['ImpactExpMatrix'])
+    summary = []
+
+    first_seen = {}   # key -> first scenario row (mirrors kernel MATCH first-match)
+    for sc in scenarios:
+        key = sc['path_code']
+        if key not in first_seen:
+            first_seen[key] = sc
+
+    for key, sc in first_seen.items():
+        xign = sc['xign']
+        yign = sc['yign']
+        if math.isnan(xign) or math.isnan(yign):
+            print(f"  SKIP (no Xign/Yign): {key}")
+            n_missing['exp'] += 1
+            continue
+
+        # Frequency from Core (P_CVE); fall back to 0 if key not in Core
+        core_entry = core.get(key)
+        freq = float(core_entry['P_CVE'] or 0.0) if core_entry and core_entry.get('P_CVE') else 0.0
+
+        dist_m, _, _ = _build_grids(xign, yign)
+        mat = compute_exp(dist_m, sc['distances'], sc['impact_v'])
+
+        name = _safe_name(key)
+        _base_hdr = [
+            f" KEY_SCENARIO  : {key}",
+            f" EVENT         : explosion (ImpactExpMatrix / P_CVE)",
+            f" QX            : {QX}",
+            f" QY            : {QY}",
+            f" SX_m_per_cell : {SX}",
+            f" SY_m_per_cell : {SY}",
+            f" XIGN_m        : {xign}",
+            f" YIGN_m        : {yign}",
+            f" P_CVE         : {freq}",
+            f" LOCATION      : {sc['location']}",
+            f" IMPACT_V      : {_fmt_list(sc['impact_v'])}",
+            f" DISTANCES_m   : {_fmt_list(sc['distances'])}",
+            f" GRID_NOTE     : row 1 = north edge (y = QY*SY - SY/2); col 1 = west edge",
+        ]
+        _write_matrix_csv(OUTPUT_DIR / 'exp' / f"{name}.csv", mat,
+                          _base_hdr + [" MATRIX_TYPE   : IMPACT  (step fn: 1 inside min(distV), 0 outside)"])
+        risk_mat = compute_exp(dist_m, sc['distances'], sc['impact_v'], return_risk=True, frequency=freq)
+        _write_matrix_csv(OUTPUT_DIR / 'exp_risk' / f"{name}.csv", risk_mat,
+                          _base_hdr + [" MATRIX_TYPE   : RISK  (P_CVE x step_fn(0.1-0.3))"])
+
+        summary.append({
+            'key_scenario': key,
+            'xign_m': round(xign, 4),
+            'yign_m': round(yign, 4),
+            'location': sc['location'],
+            'freq_P_CVE': freq,
+            'distances_m': _fmt_list(sc['distances']),
+        })
+        print(f"  {key}  [{sc['location']}]")
+
+    _write_summary_csv(
+        OUTPUT_DIR / 'exp_summary.csv', summary,
+        ['key_scenario', 'xign_m', 'yign_m', 'location', 'freq_P_CVE', 'distances_m'],
+    )
+    print(f"  -> output_v2/exp  ({len(summary)} written, {n_missing['exp']} skipped)")
+
     # ── JET FIRE ──────────────────────────────────────────────────────────────
     print("\n=== JET FIRE (P_JF from Core) ===")
     scenarios = read_jf(wb['ImpactJFMatrix'])
@@ -754,6 +887,7 @@ def main():
 
     print(f"\nAll done.  Results in: {OUTPUT_DIR.resolve()}")
     total_skip = sum(n_missing.values())
+
     if total_skip:
         print(f"  {total_skip} scenarios had no Core match (see SKIP lines above)")
 

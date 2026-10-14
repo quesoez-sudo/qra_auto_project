@@ -73,6 +73,14 @@ _THERM_DOE         =   4.0 / 3.0   # thermal dose exponent
 _THERM_PROBIT_MEAN =   5.0          # probit centre (standard 50 % point)
 _THERM_KW_SCALE    = 1000.0         # kW → W conversion inside probit argument
 
+# ── JF / Thermal kW/m² threshold fallback ────────────────────────────────────
+# Read dynamically from General row 17 at runtime.  This array is the fallback
+# used when a General-sheet value is missing, and for JF threshold matching.
+# See parameters_joint.md §B1 and §E2.
+_JF_THRESHOLDS_DEFAULT = np.array(
+    [1.6, 5.0, 7.3, 9.5, 12.5, 16.0, 20.9, 25.0, 30.0, 35.0]
+)
+
 # (CVE risk thresholds and probabilities are derived from EXP_THRESHOLDS at runtime;
 #  see _explosion_risk_prob().  Confirmed from ImpactExpMatrix AA15–AA18:
 #  limit1=0.04 bar, limit2=0.1 bar, prob_mid=0.35, prob_high=0.5.)
@@ -123,6 +131,22 @@ _GEN_JF_INDEX_RC  = (22,  4)   # D22: JF direction index count
 _GEN_JF_OFFSET_RC = (23,  4)   # D23: JF angle offset [deg]
 _GEN_JF_DIRS_RC   = (24,  4)   # D24: JF number of directions
 _GEN_JF_STEP_RC   = (25,  4)   # D25: JF angle step [deg] (0 = equal spacing)
+
+# ── Core sheet column indices (0-based within A4:R89 read range) ─────────────
+# Each index = position of the column in the row list returned by xlwings.
+# See parameters_joint.md §G for the full field mapping.
+_CORE_COL_KEY   = 0    # col A  — scenario key
+_CORE_COL_X     = 3    # col D  — source X coordinate [m]  (NOT used for CVE)
+_CORE_COL_Y     = 4    # col E  — source Y coordinate [m]  (NOT used for CVE)
+_CORE_COL_SIZE  = 6    # col G  — size label (S / M / L / XL / INST)
+_CORE_COL_TOXIC = 9    # col J  — P_TOXIC frequency
+_CORE_COL_JF    = 10   # col K  — P_JF frequency
+_CORE_COL_LPF   = 11   # col L  — P_LPF frequency
+_CORE_COL_EPF   = 12   # col M  — P_EPF frequency
+_CORE_COL_FB    = 13   # col N  — P_FB frequency
+_CORE_COL_CVE   = 14   # col O  — P_CVE frequency
+_CORE_COL_BLV   = 15   # col P  — P_BLV frequency
+_CORE_COL_FF    = 16   # col Q  — P_FF frequency
 
 # ── Module-level grid (populated by load_general_params) ─────────────────────
 XX = None   # (QY, QX) array of cell-centre X coordinates [m]
@@ -212,7 +236,7 @@ def load_general_params(wb):
         'EXP_THRESHOLDS':   exp,
         'TOX_MIN_PROB':     float(tox[0]) if len(tox) > 0 else 0.01,
         'THERM_T_EXP':      float(t_exp)  if t_exp is not None else 20.0,
-        'JF_THRESHOLDS':    np.array([1.6, 5.0, 7.3, 9.5, 12.5, 16.0, 20.9, 25.0, 30.0, 35.0]),
+        'JF_THRESHOLDS':    _JF_THRESHOLDS_DEFAULT.copy(),
         'JF_INDEX':         int(_fv(_GEN_JF_INDEX_RC)  or 8),
         'JF_DIRECTIONS':    int(_fv(_GEN_JF_DIRS_RC)   or 8),
         'JF_ANGLE_OFFSET':  float(_fv(_GEN_JF_OFFSET_RC) or 0.0),
@@ -537,22 +561,22 @@ def read_core_scenarios(ws_core):
     for row in data:
         if not row:
             break
-        key = row[0]
+        key = row[_CORE_COL_KEY]
         if key is None or key == 0 or key == -1:
             break
         scenarios.append({
-            'key':         _s(key),
-            'size':        _s(row[6]),   # col G (index 6); col C (index 2) = Dia/Noche
-            'x':           _f(row[3]),
-            'y':           _f(row[4]),
-            'prob':        _f(row[9]),
-            'p_jf':        _f(row[10]),
-            'p_lpf':       _f(row[11]),
-            'p_epf':       _f(row[12]),
-            'p_fb':        _f(row[13]),
-            'p_cve':       _f(row[14]),
-            'p_blv':       _f(row[15]),
-            'p_ff':        _f(row[16]),
+            'key':   _s(key),
+            'size':  _s(row[_CORE_COL_SIZE]),
+            'x':     _f(row[_CORE_COL_X]),
+            'y':     _f(row[_CORE_COL_Y]),
+            'prob':  _f(row[_CORE_COL_TOXIC]),
+            'p_jf':  _f(row[_CORE_COL_JF]),
+            'p_lpf': _f(row[_CORE_COL_LPF]),
+            'p_epf': _f(row[_CORE_COL_EPF]),
+            'p_fb':  _f(row[_CORE_COL_FB]),
+            'p_cve': _f(row[_CORE_COL_CVE]),
+            'p_blv': _f(row[_CORE_COL_BLV]),
+            'p_ff':  _f(row[_CORE_COL_FF]),
         })
     return scenarios
 

@@ -88,6 +88,16 @@ EVENT_CONFIGS = {
         'mat_col':    38,        # column AL
         'py_subdir':  'jf',
     },
+    'exp': {
+        'display':    'Explosion (CVE)',
+        'sheet':      'ImpactExpMatrix',
+        'key_cell':   'AA3',
+        # AA5/AA6 hold Xign/Yign (from col K/L of the matched row), not Core coords
+        'src_x_cell': 'AA5',
+        'src_y_cell': 'AA6',
+        'mat_col':    28,        # column AB
+        'py_subdir':  'exp',
+    },
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -363,6 +373,7 @@ def main():
         'ff',
         'toxic',
         'jf',
+        'exp',
     ]
     # ────────────────────────────────────────────────────────────────────────
 
