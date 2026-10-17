@@ -4,78 +4,82 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Does
 
-Python automation layer for a Quantitative Risk Assessment (QRA) tool. The engine replicates the calculations that the Excel macro workbook (`MacroQRAV6 (version 1).xlsm`) performs, computing **317×315 impact and risk matrices** for 9 event types × 6 leak sizes (Total, S, M, L, XL, INST).
+Python automation layer for a Quantitative Risk Assessment (QRA) tool. The engine replicates the calculations that the Excel macro workbook (`MacroQRAV6 (version 1).xlsm`) performs, computing **317×315 impact and risk matrices** for each event type × 6 leak sizes (Total, S, M, L, XL, INST).
 
-## Running the Engines
+This repo is the **Windows/Excel-bound** generation. A web app replacing the whole workbook is being built separately (see "Migration" below).
 
-There are two standalone scripts — choose based on the input workbook available:
+## The Final Engine: `qra_engine_v2_1.py`
 
-**`qra_engine.py`** — uses `openpyxl` (no Excel required, reads cached `.xlsx` values):
-```
-python qra_engine.py
-```
-Before running, set `_WORKSPACE` at the top to the folder containing `KernelV0 (version 1).xlsx`. Outputs CSV files to `output/` and writes back to `ImpactMatrix0`/`RiskMatrix0` sheets inside the workbook.
+**`qra_engine_v2_1.py` is the current, production engine.** It reads everything from the production workbook: `General` (grid + thresholds), `Core` (scenarios, X/Y, frequencies, per-scenario JF/thermal params), `PageControl`, and the real `* Results` sheets. It writes per-size impact/risk matrices into the `CalcBUImpact` / `CalcBURisk` sheets.
 
-**`qra_v6_engine.py`** — uses `xlwings` (requires Excel installed and open):
+### Entry points
+| How | Call | Notes |
+|---|---|---|
+| **Excel button (production)** | `QRAEngine.exe` → `qra_button_entry.py` → `run_from_button()` | IRiskMap button in VBA calls xlwings `RunFrozenPython "...\QRAEngine.exe"`; resolves the open workbook via `xw.Book.caller()` |
+| CLI, live Excel | `python qra_engine_v2_1.py --live` → `run_live()` | Opens `INPUT_FILE` in a hidden Excel with VBA disabled; writes `EXPORT_FILE` (never overwrites the `.xlsm`) |
+| CLI, openpyxl snapshot | `python qra_engine_v2_1.py` → `main()` | Reads cached values; CSV output to `output_v2.1/` |
+
+`run_live()` and `run_from_button()` share `_run_pipeline(wb, app)`. `load_general_params_live()` overwrites the module-level grid/threshold globals at the start of each run; the literals at the top of the file are only fallbacks for tests.
+
+### Building the exe
 ```
-python qra_v6_engine.py
+pyinstaller QRAEngine.spec      # entry: qra_button_entry.py → dist/QRAEngine.exe
 ```
-Before running, set `_WORKSPACE` at the top. Reads `MacroQRAV6 (version 1).xlsm`, sets `Core!C2` for each impact ID to force recalculation, then exports results to `MacroQRAV6_export_result.xlsx`.
+`QRAEngine.spec`, `build/` and `dist/` are not tracked in git. The exe is Windows-only (xlwings COM + `ctypes`).
+
+### Event coverage (`EVENT_CONFIG`, impact IDs match `PageControl!L`)
+| ID | Event | Sheet | Formula |
+|---|---|---|---|
+| 16 | TOXIC | Outdoor Toxic Results | Linear interpolation on CSV-blob distance/probability profile |
+| 17 | JF | Jet Fire Results | **Elliptical** zones, per-scenario direction count |
+| 18/19/20 | LPF / EPF / FB | Late/Early Pool Fire, Fireball Results | Circular distance → kW/m² → thermal probit → normal CDF |
+| 21 | CVE | CVE Results | Step function at overpressure threshold, uses ignition coords (Xign/Yign) |
+| 22 | BLV | BLEVE Results | **No reader yet** → zero |
+| 23 | FF | Flash Fire Results | Step on LFL / LFLF radius → 0, 1, 2 |
+
+## Older Engines (kept for reference, not production)
+
+| File | What it is |
+|---|---|
+| `qra_engine.py` | First version. openpyxl, reads `KernelV0 (version 1).xlsx` (file no longer in the folder), routing from `Directions` |
+| `qra_v6_engine.py` | xlwings. Sets `Core!C2` per Impact ID to force a live Core recalculation, exports `MacroQRAV6_export_result.xlsx` |
+| `qra_engine_v2.py` | Kernel-pinned v2: reads `KernelV0_v2_copy.xlsx` / CoreExample. v2.1 branched from it |
 
 ## Architecture
 
-### Data Flow
-```
-Excel workbook
-  ├── Core sheet          → source coordinates (X/Y) + event frequencies per scenario
-  ├── ImpactToxMatrix     → toxic dispersion profiles (CSV blob per scenario, col G)
-  ├── ImpactThermMatrix   → radiation threshold distances (cols G–P, 10 thresholds)
-  ├── ImpactExpMatrix     → overpressure threshold distances (cols J–N, 5 thresholds)
-  ├── ImpactFFMatrix      → LFL/LFLF radii per scenario
-  └── Directions/PageControl → destination cell ranges for result placement
-```
-
 ### Computation Pattern
 For each event, the engine:
-1. Reads scenario rows from the relevant `ImpactXXMatrix` sheet
-2. Matches each row to `Core` by scenario key (col A in Core, col B in effect sheets)
-3. Computes Euclidean distance from the source point to every cell in the 317×315 grid
-4. Applies a formula to get a per-cell impact value (see below)
+1. Reads scenario rows from the event's Results sheet
+2. Matches each row to `Core` by scenario key
+3. Computes distance from the source point to every cell in the 317×315 grid
+4. Applies the event formula to get a per-cell impact value
 5. Accumulates: `impact_matrix += cell_impact`, `risk_matrix += cell_impact × frequency`
-6. Runs this accumulation 6 times (once per size filter; "Total" uses all scenarios)
+6. Repeats per size filter ("Total" uses all scenarios)
 
-### Formulas by Event Type
-
-| Formula | Events | Key logic |
-|---------|--------|-----------|
-| `thermal` | JF, LPF, EPF, FB | Interpolate kW/m² from distance, apply probit (`-36.38 + 2.56 × ln(...)`), then normal CDF |
-| `explosion` | CVE, BLV | Interpolate bar from distance, step function at `limitOV2=0.3 bar` → 0 or 1 |
-| `ff` | FF | Step function on LFL radius and LFLF radius → values 0, 1, or 2 |
-| `toxic` | TOXIC | Linear interpolation on distance-probability profile from CSV blob |
-| `zero` | LATE_EXP | No scenarios; always zero matrices |
-
-**CVE special case:** uses ignition point coordinates from `ImpactExpMatrix` cols V/W instead of the source coordinates from `Core`.
-
-### Grid Constants (do not change without reading `engine_architecture.md`)
-- `QX=315`, `QY=317`, `SX≈1.0698 m/cell`, `SY≈1.069425 m/cell`
+### Grid Constants (do not change without reading `docs/engine_architecture.md`)
+- `QX=315`, `QY=317`, `SX≈1.0698 m/cell`, `SY≈1.069425 m/cell` (v2.1 reads them from `General` at runtime)
 - Cell centers: `x = SX × (i + 0.5)`, `y = SY × (j + 0.5)`
+- Open question: `General` gives Y = 339.5 m / 317 = 1.07098 m/cell, which disagrees with SY above
 
-### Key Differences Between the Two Scripts
-- `qra_engine.py`: reads routing from `Directions` sheet (rows 2–10, cols E–J); event config is hardcoded in `EVENTS` list
-- `qra_v6_engine.py`: reads routing from `PageControl` sheet (cols L–R); event config in `IMPACT_CONFIG` dict (IDs 16–24); uses `xlwings` for live Excel COM interaction
+## Dependencies (`requirements.txt`)
+- `numpy`: grid math
+- `scipy`: `erf` for the normal CDF in v2.1 (older engines use an inline A&S approximation)
+- `openpyxl`: snapshot reads
+- `xlwings`: live Excel COM (Windows + Excel required for `--live` and the exe)
 
-## Dependencies
+## Tests
+- `tests/test_qra_v2_1_helpers.py`: unit tests for v2.1 helpers
+- `tests/test_live_readers.py`, `tests/test_run_from_button_headless.py`: need Excel + the `...-Win11-cWvAMQq4D.xlsm` workbook at the project root; the headless test closes without saving
+- `tests/compare_excel.py`, `tests/compare_thermal_all.py`: Python vs Excel matrix parity
 
-- `numpy` — all grid math
-- `openpyxl` — Excel I/O in `qra_engine.py`
-- `xlwings` — live Excel COM in `qra_v6_engine.py` (requires Excel installed)
+## Known Issues
+See `docs/open_questions.md` and `parameters_joint.md`. Key items:
+- **BLEVE:** no reader in v2.1 (own column layout, psi units, uses Core X/Y not Xign/Yign)
+- **Core snapshot:** v2.1 reads Core once; Core's scenario set is formula-driven per Impact ID (`qra_v6_engine.py` handles this by recalculating per ID)
+- **Late Explosion:** no scenarios / formula yet
+- **QY dimension:** source data gives 317.46; engine uses `floor(317)`
 
-No `scipy` — the normal CDF is implemented inline via Abramowitz & Stegun approximation in `_norm_cdf()`.
+## Migration (web app)
+The full workbook (inputs + PHAST + results) is being rebuilt as a web app, developed on macOS. The VBA source, form layouts and the starting prompt are exported to `QRA_Macro_Export/` (kept outside this repo: `MASTER_PROMPT.md`, `forms_viewer.html`, `vba/`). In that project, `qra_engine_v2_1.py` is the reference for Section 2 (results/matrices). Its calculation functions are portable; its xlwings/exe layer is not.
 
-## Known Issues & Deferred Items
-
-See `docs/open_questions.md` for the full list. Key blockers:
-- **BLEVE (BLV):** `ImpactExpMatrix` has 0 BLEVE rows → zero matrices
-- **Fireball (FB):** D7203/ST1 scenarios missing from ImpactThermMatrix rows 2–31
-- **Late Explosion:** no scenarios yet; formula/probability column TBD
-- **QY dimension:** source data gives 317.46; engine uses `floor(317)` — may drop ~0.5m bottom edge
+Excel files are git-ignored (and the `.xlsm` exceeds GitHub's 100 MB limit). Copy them manually.
