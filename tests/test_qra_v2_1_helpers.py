@@ -176,7 +176,28 @@ def test_bulk_read_normalizes_shapes():
     _check('missing 1x1 cell -> [[None]]', eng._bulk_read(empty_ws, 5, 5, 5, 5) == [[None]])
 
 
+def test_compute_event_live_impact_max_risk_sum():
+    # Two overlapping FF scenarios at the same source: impact must be the
+    # cell-wise MAX (kernel MaxMatrix), risk the cell-wise SUM (kernel SumMatrix).
+    evt = {'formula': 'ff', 'freq_col': 'P_FF'}
+    core = [
+        {'key': 'A', 'X': 100.0, 'Y': 100.0, 'size': 'M', 'P_FF': 1e-4},
+        {'key': 'B', 'X': 100.0, 'Y': 100.0, 'size': 'M', 'P_FF': 2e-4},
+    ]
+    results_idx = {'A': {'lfl_r': 10.0, 'lflf_r': 20.0},
+                   'B': {'lfl_r': 10.0, 'lflf_r': 20.0}}
+    imp, risk, matched, _ = eng.compute_event_live(evt, core, results_idx)
+    _check('both scenarios matched', matched == 2, f'got {matched}')
+    for sz in ('Total', 'M'):
+        _check(f'[{sz}] impact max is MAX of scenarios (2), not SUM (4)',
+               imp[sz].max() == 2.0, f'got {imp[sz].max()}')
+        _check(f'[{sz}] risk max is SUM of frequencies (3e-4)',
+               abs(risk[sz].max() - 3e-4) < 1e-12, f'got {risk[sz].max()}')
+    _check('[S] untouched', imp['S'].max() == 0.0 and risk['S'].max() == 0.0)
+
+
 if __name__ == '__main__':
+    test_compute_event_live_impact_max_risk_sum()
     test_sheet_constants()
     test_frozen_sets_and_restores_on_success()
     test_frozen_restores_on_exception()

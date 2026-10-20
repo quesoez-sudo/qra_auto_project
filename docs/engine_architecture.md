@@ -126,7 +126,7 @@ elif dist <= LFLF_dist (col G):   impact = limit2 = 1  (transition zone)
 else:                              impact = limit1 = 0  (outside)
 ```
 
-Impact matrix accumulates the impact value; Risk = impact × scenario probability.
+Impact matrix keeps the cell-wise MAX across scenarios; Risk = scenario probability × lethality, summed across scenarios.
 
 > Note: Late Explosion uses ImpactFFMatrix with the same formula.
 > Currently 0 Late Explosion scenarios exist → zero matrices. See open_questions.md #8, #10.
@@ -214,8 +214,8 @@ risk_matrix   = zeros(QY, QX)
 for scenario in matched_scenarios:
     if scenario.size != target_size (and target != Total): skip
     cell_impact = formula(scenario, grid)          # shape (317, 315)
-    impact_matrix += cell_impact
-    risk_matrix   += cell_impact * scenario.probability
+    impact_matrix  = maximum(impact_matrix, cell_impact)   # MAX (kernel MaxMatrix)
+    risk_matrix   += scenario.probability * lethality(cell_impact)   # SUM (kernel SumMatrix)
 ```
 
 **Matching rule:** Scenario key from ImpactXXMatrix col B must exist in Core col A.

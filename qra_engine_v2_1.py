@@ -1644,7 +1644,8 @@ def read_core_live(ws_core):
 
 # ── Per-size accumulation ─────────────────────────────────────────────────────
 def compute_event_live(evt, core_scenarios, results_idx):
-    """Accumulate impact/risk matrices per size for one event (one Impact ID).
+    """Accumulate impact/risk matrices per size for one event (one Impact ID):
+    impact is the cell-wise MAX across scenarios, risk the cell-wise SUM.
 
     core_scenarios : list of dicts from read_core_live() — the LIVE Core row set for
                       this event (already reflecting the current C2/H2 state).
@@ -1714,12 +1715,14 @@ def compute_event_live(evt, core_scenarios, results_idx):
             unmatched += 1
             continue
 
+        # Impact = cell-wise MAX across scenarios (kernel MaxMatrix); risk = cell-wise
+        # SUM (kernel SumMatrix). Summing impact gave e.g. 977 kW/m² or toxic prob 8.
         matched += 1
-        impact_mats['Total'] += imp
-        risk_mats['Total']   += risk
+        impact_mats['Total'] = np.maximum(impact_mats['Total'], imp)
+        risk_mats['Total']  += risk
         if size is not None:
-            impact_mats[size] += imp
-            risk_mats[size]   += risk
+            impact_mats[size] = np.maximum(impact_mats[size], imp)
+            risk_mats[size]  += risk
 
     return impact_mats, risk_mats, matched, unmatched
 

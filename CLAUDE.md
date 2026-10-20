@@ -53,7 +53,7 @@ For each event, the engine:
 2. Matches each row to `Core` by scenario key
 3. Computes distance from the source point to every cell in the 317×315 grid
 4. Applies the event formula to get a per-cell impact value
-5. Accumulates: `impact_matrix += cell_impact`, `risk_matrix += cell_impact × frequency`
+5. Accumulates: `impact_matrix = max(impact_matrix, cell_impact)` (cell-wise MAX, kernel `MaxMatrix`), `risk_matrix += frequency × lethality(cell_impact)` (cell-wise SUM, kernel `SumMatrix`)
 6. Repeats per size filter ("Total" uses all scenarios)
 
 ### Grid Constants (do not change without reading `docs/engine_architecture.md`)
