@@ -33,7 +33,7 @@ pyinstaller QRAEngine.spec      # entry: qra_button_entry.py → dist/QRAEngine.
 | 16 | TOXIC | Outdoor Toxic Results | Linear interpolation on CSV-blob distance/probability profile |
 | 17 | JF | Jet Fire Results | **Elliptical** zones, per-scenario direction count |
 | 18/19/20 | LPF / EPF / FB | Late/Early Pool Fire, Fireball Results | Circular distance → kW/m² → thermal probit → normal CDF |
-| 21 | CVE | CVE Results | Step function at overpressure threshold, uses ignition coords (Xign/Yign) |
+| 21 | CVE | CVE Results | Overpressure (bar) interpolated from J–N (`CVE_INTERP_MODE`: linear default, loglog kept), centred on Xign/Yign (P/Q), one row per ignition location. Risk = P_CVE × VUL_OVP (`AJ:AO`) curve of the row's building type (`Location Data!I` via `G`) |
 | 22 | BLV | BLEVE Results | **No reader yet** → zero |
 | 23 | FF | Flash Fire Results | Step on LFL / LFLF radius → 0, 1, 2 |
 

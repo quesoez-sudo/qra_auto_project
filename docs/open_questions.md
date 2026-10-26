@@ -166,6 +166,32 @@ do not attempt a fix until the exact PHAST coordinate derivation method is known
 
 ---
 
+## 12. CVE — full P_CVE on every ignition row (possible double counting)
+
+**Status:** ⏸️ Deferred on purpose — revisit later (`TODO(CVE-freq)` in `qra_engine_v2_1.py`)
+
+**Finding:** `CVE Results` has one row per scenario × ignition location (column G, e.g.
+`1E -Horno H4753` and `2E - Horno H4754`), each with its own explosion centre (P/Q) and
+J–N distances. Core gives one P_CVE per scenario.
+
+**Current behaviour:** every row with an explosion gets the FULL P_CVE, and their risks are
+summed. A scenario that explodes at two locations therefore counts its frequency twice.
+Each run logs a warning listing how many scenarios are affected (4 in
+`MacroQRAV6 Primera corrida.xlsm`).
+
+**Options later:** split P_CVE across ignition rows (equally, or by each location's
+ignition probability), or confirm that Core's P_CVE is already per location.
+
+**Related CVE decisions (2026-10-22):**
+- J–N headers are treated as **bar** (PHAST labels them psi). Matched against
+  `General!J19:N19`.
+- Interpolation is **linear** (`CVE_INTERP_MODE = 'linear'`). A `'loglog'` mode is kept
+  for comparison.
+- The building type for the lethality curve comes from `Location Data!I`, looked up via
+  `CVE Results!G`.
+
+---
+
 ## Summary Table
 
 | # | Topic | Status |
@@ -181,3 +207,4 @@ do not attempt a fix until the exact PHAST coordinate derivation method is known
 | 9 | QY = 317 vs 318 (non-integer grid) | ⚠️ Minor |
 | 10 | Late Explosion probability column in Core | ⏸️ Deferred — zero output |
 | 11 | Impact zone positional shift ~5 cells in X and Y | ⚠️ Accepted — within QRA tolerance |
+| 12 | CVE full P_CVE per ignition row (double counting) | ⏸️ Deferred on purpose |

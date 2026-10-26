@@ -12,10 +12,11 @@ Covered event types (see EVENT_CONFIG for the sheet/frequency mapping):
   Flash Fire — Flash Fire Results    — step function on LFL / LFLF radius
   Toxic      — Outdoor Toxic Results — CSV-blob probability interpolation
   Jet Fire   — Jet Fire Results      — ELLIPTICAL zones, per-scenario direction count
-  Explosion/CVE — CVE Results        — step function, ignition-point coords (Xign/Yign)
+  Explosion/CVE — CVE Results        — interpolated overpressure (bar), ignition-point coords
+                                       (Xign/Yign), VUL_OVP lethality by Location Data building type
 
 Known gap: BLEVE Results has no reader yet (own column layout, psi units, uses Core
-X/Y not Xign/Yign — can't reuse compute_exp()). Also: Core is read once per run via
+X/Y not Xign/Yign — can't reuse read_exp()). Also: Core is read once per run via
 openpyxl (a static snapshot) — qra_v6_engine.py sets Core!C2 to each Impact ID and
 forces a live recalculation via xlwings before reading, since Core's scenario set is
 formula-driven per Impact ID. This engine does not yet do that — see parameters_joint.md.
@@ -89,10 +90,16 @@ KW_THRESHOLDS = np.array([1.6, 5.0, 7.3, 9.5, 12.5, 16.0, 20.9, 25.0, 30.0, 35.0
 # ("Flammable concentration levels") at runtime
 FF_LEVELS = [0.0, 1.0, 2.0]
 
-# CVE risk step-function values [limit1, limit2, prob_mid, prob_high, ...] — overwritten
-# from General!J19:N19 ("Overpressure levels") at runtime. NOT the same thing as the
-# per-scenario bar thresholds in ImpactExpMatrix/CVE Results row 1 — see compute_exp().
+# CVE overpressure levels (bar) — overwritten from General!J19:N19 ("Overpressure levels")
+# at runtime. CVE Results!J1:N1 headers are matched against these; J-N hold the distance
+# (m) at which each level is reached. PHAST labels them psi, but they are handled as bar.
 EXP_THRESHOLDS = [0.04, 0.1, 0.35, 0.5, 1.0]
+
+# CVE overpressure interpolation between the J-N distance points:
+#   'linear' — straight line in bar vs m (same as thermal). Default, used for all runs.
+#   'loglog' — straight line in log(bar) vs log(m); closer to how blast overpressure
+#              decays physically. Kept for comparison only.
+CVE_INTERP_MODE = 'linear'
 
 # Toxic minimum-probability filter — overwritten from General!J20 ("Toxic Levels", first
 # value) at runtime
@@ -481,63 +488,65 @@ def compute_jf(x_c, y_c,
 
 
 # ── EXPLOSION (CVE) ───────────────────────────────────────────────────────────
-def compute_exp(dist_m, distances, impact_v, return_risk=False, frequency=1.0):
+def _interp_ovp(dist_m, dv, pv, mode='linear'):
+    """Overpressure (bar) per cell from threshold distances dv (m, shrinking) and their
+    levels pv (bar, rising). Inside dv[-1] -> pv[-1] (cap), beyond dv[0] -> 0."""
+    impact = np.zeros_like(dist_m, dtype=float)
+    impact[dist_m <= dv[-1]] = pv[-1]
+    for i in range(len(dv) - 1):
+        if dv[i + 1] == dv[i]:
+            continue
+        mask = (dist_m > dv[i + 1]) & (dist_m <= dv[i])
+        d = dist_m[mask]
+        if mode == 'loglog':
+            slope = math.log(pv[i + 1] / pv[i]) / math.log(dv[i + 1] / dv[i])
+            impact[mask] = pv[i] * (d / dv[i]) ** slope
+        else:
+            slope = (pv[i + 1] - pv[i]) / (dv[i + 1] - dv[i])
+            impact[mask] = pv[i] + slope * (d - dv[i])
+    return impact
+
+
+def _ovp_lethality(ovp, segments):
+    """bar array -> lethality array using one VUL_OVP building-type curve.
+    segments: [{'ovp0','l0','ovp1','l1','x'}, ...] sorted by ovp0. Inside a segment
+    L = L0 * (OVP/OVP0)^X, i.e. the sheet's (1/K)*OVP^X. Below the first OVP0 -> 0,
+    at/above the last OVP1 -> its L1."""
+    p = np.zeros_like(ovp, dtype=float)
+    if not segments:
+        return p
+    for s in segments:
+        m = (ovp >= s['ovp0']) & (ovp < s['ovp1'])
+        p[m] = s['l0'] * (ovp[m] / s['ovp0']) ** s['x']
+    p[ovp >= segments[-1]['ovp1']] = segments[-1]['l1']
+    return np.clip(p, 0.0, 1.0)
+
+
+def compute_exp(dist_m, distances, levels=None, return_risk=False, frequency=1.0,
+                vul_curve=None, mode=None):
     """
-    Explosion (CVE) impact/risk formula (mirrors ImpactExpMatrix AB1).
+    Explosion (CVE) impact/risk.
 
-    dist_m    : (QY, QX) distances in metres from ignition point (Xign, Yign)
-    distances : 5 values (cols J-N per scenario row) — ascending distances (m) at
-                which overpressure equals the corresponding impact_v thresholds.
-                Zero or NaN entries are excluded.
-    impact_v  : 5 threshold values read from row 1 cols J-N of the sheet (from PHAST;
-                falls back to hardcoded values if the sheet's headers are broken).
-                Paired with distances for interpolation intent.
-
-    Effective behaviour (step function):
-      The Excel formula calls MATCH(d, distV, -1) where distV is in ASCENDING order,
-      but match_type=-1 expects DESCENDING. When given ascending distV, MATCH(-1)
-      treats the first (smallest) element as the "maximum" of the array. Any d >=
-      min(distV) causes MATCH to return #N/A, which the outer IFERROR catches → 0.
-      Only d < min(distV) is handled by the inner IF branch → 1.0.
-      Result: impact = 1.0 inside the first distance threshold, 0 everywhere else.
-
-    Risk: uses EXP_THRESHOLDS = [limit1, limit2, prob_mid, prob_high, ...] read from
-    General!J19:N19 ("Overpressure levels"), same shape as qra_v6_engine.py's
-    _explosion_risk_prob(): risk = 0 below limit1, prob_mid in [limit1, limit2),
-    prob_high >= limit2.
-
-    NOTE (CVE is more complex than this — flagged, not fixed here): `impact` above is
-    a BINARY 0/1 step value (the MATCH(-1) quirk), not a continuous bar-pressure value
-    like v6's formula_explosion produces. Feeding a 0/1 input through bar-unit limits
-    (limit1=0.04, limit2=0.1) only distinguishes "outside -> 0" from "inside -> prob_high"
-    — the prob_mid band can never be hit since impact is never between limit1 and limit2.
-    A real fix means either (a) making compute_exp produce an actual bar-pressure impact
-    via proper interpolation (abandoning the MATCH(-1) mirror), or (b) accepting the
-    binary impact and picking a deliberate two-value risk mapping instead of reusing
-    General's 4-value step function as-is. Left as this degenerate-but-defined behaviour
-    for now — revisit before CVE risk numbers are relied on.
+    dist_m    : (QY, QX) distances in metres from the explosion centre (Xign, Yign)
+    distances : CVE Results J-N — distance (m) at which overpressure drops to each of
+                `levels`. Zero/NaN entries are skipped; all-zero rows give an empty matrix.
+    levels    : overpressure (bar) per distance — defaults to EXP_THRESHOLDS (General)
+    vul_curve : VUL_OVP segments for the row's building type (see _ovp_lethality)
+    mode      : 'linear' | 'loglog' — defaults to CVE_INTERP_MODE
+    Returns   : overpressure (bar) impact matrix, or frequency x lethality if return_risk
     """
+    levels = np.asarray(EXP_THRESHOLDS if levels is None else levels, dtype=float)
     dv = np.array([float(x) if x not in ('', None) else np.nan for x in distances])
     valid = ~np.isnan(dv) & (dv > 0)
-    dv_v = dv[valid]
+    dv_v, pv_v = dv[valid], levels[valid]
 
     if len(dv_v) == 0:
-        return np.zeros_like(dist_m, dtype=float)
-
-    # Step function: 1.0 inside the minimum (first) distance threshold, 0 outside.
-    # This mirrors the MATCH(-1)-on-ascending-array failure in the Excel formula.
-    threshold = float(np.min(dv_v))
-    impact = np.zeros_like(dist_m, dtype=float)
-    impact[dist_m < threshold] = 1.0
+        impact = np.zeros_like(dist_m, dtype=float)
+    else:
+        impact = _interp_ovp(dist_m, dv_v, pv_v, mode or CVE_INTERP_MODE)
 
     if return_risk:
-        thr = EXP_THRESHOLDS
-        limit1, limit2 = thr[0], thr[1]
-        prob_mid  = thr[2] if len(thr) > 2 else 0.0
-        prob_high = thr[3] if len(thr) > 3 else 1.0
-        risk = np.where(impact >= limit2, prob_high,
-               np.where(impact >= limit1, prob_mid, 0.0))
-        return frequency * risk
+        return frequency * _ovp_lethality(impact, vul_curve)
     return impact
 
 
@@ -659,16 +668,11 @@ def read_tox(ws):
     return scenarios
 
 
-# Production CVE Results sheets have been seen with broken row-1 threshold headers
-# (J1=1, K1:N1=#N/A instead of the real bar values). Fall back to the known PHAST
-# values — same column order confirmed against kernel V0-4's intact J:N headers.
-_EXP_IMPACT_V_FALLBACK = [0.83, 0.34, 0.1, 0.17, 0.03]
-
 def read_exp(ws):
-    # Row 1 cols J-N: impact threshold values (from PHAST — not hardcoded).
-    impact_v = [_flt(_v(ws, 1, c)) for c in ['J', 'K', 'L', 'M', 'N']]
-    if any(math.isnan(v) for v in impact_v):
-        impact_v = list(_EXP_IMPACT_V_FALLBACK)
+    # Row 1 J-N headers are matched against General's overpressure levels, so
+    # distances[i] always pairs with EXP_THRESHOLDS[i] (NaN if a header is missing).
+    thresholds = list(EXP_THRESHOLDS)
+    col_map = _match_threshold_cols(ws, thresholds, _col('J'), _col('N'), sheet_name=ws.title)
     scenarios = []
     for r in range(2, ws.max_row + 1):
         b = _v(ws, r, 'B')
@@ -678,13 +682,85 @@ def read_exp(ws):
             'path_code': str(b),
             'scenario':  str(_v(ws, r, 'C')),
             'weather':   str(_v(ws, r, 'D')),
-            'location':  str(_v(ws, r, 'G')),
+            'location':  str(_v(ws, r, 'G')).strip(),
             'xign':      _flt(_v(ws, r, 'P')),
             'yign':      _flt(_v(ws, r, 'Q')),
-            'distances': [_flt(_v(ws, r, c)) for c in ['J', 'K', 'L', 'M', 'N']],
-            'impact_v':  impact_v,
+            'distances': [_flt(ws.cell(row=r, column=col_map[t]).value) if t in col_map else np.nan
+                          for t in thresholds],
         })
     return scenarios
+
+
+# VUL_OVP (CVE Results!AJ1:AV20): one row per curve segment. Only AJ (Type) and
+# AL:AO (L0, OVP0, L1, OVP1) are read — X is recomputed from them (same as AP).
+_VUL_COLS = ('AJ', 'AO')
+# Location Data: A = Location Name (matches CVE Results!G), I = Building Type.
+_LOC_COLS = ('A', 'I')
+
+
+def _parse_vul_rows(rows):
+    """rows of [Type, Type_n, L0, OVP0, L1, OVP1] -> {type: [segment, ...]} sorted by OVP0."""
+    curves = {}
+    for row in rows:
+        if not row or row[0] in (None, ''):
+            break
+        btype = str(row[0]).strip()
+        l0, ovp0, l1, ovp1 = (_flt(v) for v in row[2:6])
+        if any(math.isnan(v) or v <= 0 for v in (l0, ovp0, l1, ovp1)) or ovp1 == ovp0:
+            _warn(f"VUL_OVP: segment {row[1]!r} has invalid L0/OVP0/L1/OVP1 — skipped.")
+            continue
+        x = math.log(l1 / l0) / math.log(ovp1 / ovp0)
+        curves.setdefault(btype, []).append({'ovp0': ovp0, 'l0': l0, 'ovp1': ovp1, 'l1': l1, 'x': x})
+    for segs in curves.values():
+        segs.sort(key=lambda s: s['ovp0'])
+    return curves
+
+
+def _parse_location_rows(rows):
+    """rows of Location Data A:I -> {location name: building type}."""
+    btypes = {}
+    for row in rows:
+        if not row or row[0] in (None, ''):
+            break
+        btypes[str(row[0]).strip()] = str(row[-1]).strip() if row[-1] is not None else ''
+    return btypes
+
+
+def read_vul_ovp(ws):
+    rows = ws.iter_rows(min_row=2, min_col=_col(_VUL_COLS[0]), max_col=_col(_VUL_COLS[1]),
+                        values_only=True)
+    return _parse_vul_rows(rows)
+
+
+def read_location_btypes(ws):
+    rows = ws.iter_rows(min_row=2, min_col=_col(_LOC_COLS[0]), max_col=_col(_LOC_COLS[1]),
+                        values_only=True)
+    return _parse_location_rows(rows)
+
+
+def _vul_by_location(curves, btypes):
+    """{location: VUL_OVP segments} — warns for building types with no curve."""
+    out = {}
+    for loc, bt in btypes.items():
+        if bt in curves:
+            out[loc] = curves[bt]
+        else:
+            _warn(f"Location Data: '{loc}' building type {bt!r} not in VUL_OVP — CVE risk 0 there.")
+    return out
+
+
+def _group_by_key(rows):
+    """All rows per path_code — CVE has one row per ignition location for a scenario."""
+    idx = {}
+    for r in rows:
+        idx.setdefault(r['path_code'], []).append(r)
+    return idx
+
+
+def _cve_multi_row_keys(rows_by_key):
+    """Scenario keys with more than one ignition row that actually has an explosion."""
+    return [k for k, rows in rows_by_key.items()
+            if sum(1 for r in rows if any(d > 0 for d in r['distances'] if not math.isnan(d))) > 1]
 
 
 def read_jf(ws):
@@ -852,11 +928,10 @@ def read_tox_live(ws):
 
 def read_exp_live(ws):
     """Live xlwings equivalent of read_exp() — identical output shape."""
+    thresholds = list(EXP_THRESHOLDS)
     col_j, col_n = _col('J'), _col('N')
     header = _bulk_read(ws, 1, 1, col_j, col_n)[0]
-    impact_v = [_flt(v) for v in header]
-    if any(math.isnan(v) for v in impact_v):
-        impact_v = list(_EXP_IMPACT_V_FALLBACK)
+    col_map = _match_threshold_cols_live(header, thresholds, col_j, sheet_name=ws.name)
 
     col_b = _col('B')
     last_row = ws.used_range.last_cell.row
@@ -871,13 +946,24 @@ def read_exp_live(ws):
             'path_code': str(b),
             'scenario':  str(row[_col('C') - col_b]),
             'weather':   str(row[_col('D') - col_b]),
-            'location':  str(row[_col('G') - col_b]),
+            'location':  str(row[_col('G') - col_b]).strip(),
             'xign':      _flt(row[_col('P') - col_b]),
             'yign':      _flt(row[_col('Q') - col_b]),
-            'distances': [_flt(row[_col(c) - col_b]) for c in ['J', 'K', 'L', 'M', 'N']],
-            'impact_v':  impact_v,
+            'distances': [_flt(row[col_map[t] - col_b]) if t in col_map else np.nan
+                          for t in thresholds],
         })
     return scenarios
+
+
+def read_vul_ovp_live(ws, max_rows=200):
+    """Live xlwings equivalent of read_vul_ovp()."""
+    return _parse_vul_rows(_bulk_read(ws, 2, 1 + max_rows, _col(_VUL_COLS[0]), _col(_VUL_COLS[1])))
+
+
+def read_location_btypes_live(ws):
+    """Live xlwings equivalent of read_location_btypes()."""
+    last_row = max(ws.used_range.last_cell.row, 2)
+    return _parse_location_rows(_bulk_read(ws, 2, last_row, _col(_LOC_COLS[0]), _col(_LOC_COLS[1])))
 
 
 def read_jf_live(ws):
@@ -1330,20 +1416,18 @@ def main():
 
     # ── EXPLOSION (CVE) ───────────────────────────────────────────────────────
     # Source coords are Xign/Yign from col P/Q of each row (NOT from Core).
-    # Frequency (P_CVE) still comes from Core.
-    # The kernel formula uses MATCH(AA3, B:B, 0) = first row per unique key.
-    # We generate one CSV per unique key (first matching row) to match kernel behaviour.
+    # Frequency (P_CVE) still comes from Core. One CSV per row: a scenario has one row
+    # per ignition location (G), each with its own centre and its own building type.
+    # TODO(CVE-freq): every row gets the FULL P_CVE, so a scenario with 2 ignition rows
+    # counts its frequency twice in risk. Kept on purpose for now — see open_questions.md.
     print("\n=== EXPLOSION (P_CVE from Core, sheet 'CVE Results', coords from Xign/Yign) ===")
     scenarios = read_exp(wb['CVE Results'])
+    vul_by_loc = _vul_by_location(read_vul_ovp(wb['CVE Results']),
+                                  read_location_btypes(wb['Location Data']))
     summary = []
 
-    first_seen = {}   # key -> first scenario row (mirrors kernel MATCH first-match)
     for sc in scenarios:
         key = sc['path_code']
-        if key not in first_seen:
-            first_seen[key] = sc
-
-    for key, sc in first_seen.items():
         xign = sc['xign']
         yign = sc['yign']
         if math.isnan(xign) or math.isnan(yign):
@@ -1356,9 +1440,9 @@ def main():
         freq = float(core_entry['P_CVE'] or 0.0) if core_entry and core_entry.get('P_CVE') else 0.0
 
         dist_m, _, _ = _build_grids(xign, yign)
-        mat = compute_exp(dist_m, sc['distances'], sc['impact_v'])
+        mat = compute_exp(dist_m, sc['distances'])
 
-        name = _safe_name(key)
+        name = _safe_name(f"{key}_{sc['location']}")
         _base_hdr = [
             f" KEY_SCENARIO  : {key}",
             f" EVENT         : explosion (ImpactExpMatrix / P_CVE)",
@@ -1370,15 +1454,17 @@ def main():
             f" YIGN_m        : {yign}",
             f" P_CVE         : {freq}",
             f" LOCATION      : {sc['location']}",
-            f" IMPACT_V      : {_fmt_list(sc['impact_v'])}",
+            f" LEVELS_bar    : {_fmt_list(EXP_THRESHOLDS)}",
             f" DISTANCES_m   : {_fmt_list(sc['distances'])}",
+            f" INTERP        : {CVE_INTERP_MODE}",
             f" GRID_NOTE     : row 1 = north edge (y = QY*SY - SY/2); col 1 = west edge",
         ]
         _write_matrix_csv(OUTPUT_DIR / 'exp' / f"{name}.csv", mat,
-                          _base_hdr + [" MATRIX_TYPE   : IMPACT  (step fn: 1 inside min(distV), 0 outside)"])
-        risk_mat = compute_exp(dist_m, sc['distances'], sc['impact_v'], return_risk=True, frequency=freq)
+                          _base_hdr + [" MATRIX_TYPE   : IMPACT  (overpressure, bar)"])
+        risk_mat = compute_exp(dist_m, sc['distances'], return_risk=True, frequency=freq,
+                               vul_curve=vul_by_loc.get(sc['location']))
         _write_matrix_csv(OUTPUT_DIR / 'exp_risk' / f"{name}.csv", risk_mat,
-                          _base_hdr + [" MATRIX_TYPE   : RISK  (P_CVE x EXP_THRESHOLDS step fn — see compute_exp() CVE note)"])
+                          _base_hdr + [" MATRIX_TYPE   : RISK  (P_CVE x VUL_OVP lethality)"])
 
         summary.append({
             'key_scenario': key,
@@ -1643,14 +1729,16 @@ def read_core_live(ws_core):
 
 
 # ── Per-size accumulation ─────────────────────────────────────────────────────
-def compute_event_live(evt, core_scenarios, results_idx):
+def compute_event_live(evt, core_scenarios, results_idx, vul_by_loc=None):
     """Accumulate impact/risk matrices per size for one event (one Impact ID):
     impact is the cell-wise MAX across scenarios, risk the cell-wise SUM.
 
     core_scenarios : list of dicts from read_core_live() — the LIVE Core row set for
                       this event (already reflecting the current C2/H2 state).
     results_idx     : {path_code: result_row} from _index_by_key() on the matching
-                      Results-sheet reader output (read_therm/read_ff/read_tox/read_exp/read_jf).
+                      Results-sheet reader output (read_therm/read_ff/read_tox/read_jf).
+                      For 'exp' it is {path_code: [rows]} from _group_by_key().
+    vul_by_loc      : 'exp' only — {location: VUL_OVP segments} from _vul_by_location().
 
     Returns (impact_mats, risk_mats, matched, unmatched) — each *_mats is
     {size: (QY,QX) ndarray} for size in SIZES.
@@ -1693,13 +1781,23 @@ def compute_event_live(evt, core_scenarios, results_idx):
             risk = _to_risk(imp, freq, 'toxic')
 
         elif formula == 'exp':
-            xign, yign = res.get('xign'), res.get('yign')
-            if xign is None or yign is None or math.isnan(xign) or math.isnan(yign):
+            # One row per ignition location: impact = MAX over rows, risk = SUM.
+            # TODO(CVE-freq): each row gets the FULL P_CVE, so 2 ignition rows count the
+            # scenario's frequency twice. Kept on purpose for now — see open_questions.md.
+            rows = [r for r in res
+                    if r.get('xign') is not None and r.get('yign') is not None
+                    and not math.isnan(r['xign']) and not math.isnan(r['yign'])]
+            if not rows:
                 unmatched += 1
                 continue
-            dist_m, _, _ = _build_grids(xign, yign)
-            imp  = compute_exp(dist_m, res['distances'], res['impact_v'])
-            risk = compute_exp(dist_m, res['distances'], res['impact_v'], return_risk=True, frequency=freq)
+            imp  = np.zeros((QY, QX))
+            risk = np.zeros((QY, QX))
+            for r in rows:
+                dist_m, _, _ = _build_grids(r['xign'], r['yign'])
+                curve = (vul_by_loc or {}).get(r['location'])
+                imp   = np.maximum(imp, compute_exp(dist_m, r['distances']))
+                risk += compute_exp(dist_m, r['distances'], return_risk=True,
+                                    frequency=freq, vul_curve=curve)
 
         elif formula == 'jf':
             n_dirs       = int(_scenario_val(core_row, 'discharge_dirs', JF_N_DIRS_DEFAULT))
@@ -1795,11 +1893,31 @@ def _run_pipeline(wb, app):
 
             live_reader = _LIVE_READER_FN[evt['formula']]
             results_rows = live_reader(wb.sheets[evt['sheet']])
-            results_idx = _index_by_key(results_rows)
             print(f"  {evt['sheet']}: {len(results_rows)} rows read (live)")
 
+            vul_by_loc = None
+            if evt['formula'] == 'exp':
+                results_idx = _group_by_key(results_rows)
+                if 'Location Data' in [s.name for s in wb.sheets]:
+                    btypes = read_location_btypes_live(wb.sheets['Location Data'])
+                else:
+                    _warn("Sheet 'Location Data' not found — no building types, CVE risk will be 0.")
+                    btypes = {}
+                vul_by_loc = _vul_by_location(read_vul_ovp_live(wb.sheets[evt['sheet']]), btypes)
+                for loc in sorted({r['location'] for r in results_rows} - set(vul_by_loc)):
+                    _warn(f"Impact {iid} (CVE): location '{loc}' has no building type/VUL_OVP "
+                          f"curve — its CVE risk is 0.")
+                multi = _cve_multi_row_keys(results_idx)
+                if multi:
+                    _warn(f"Impact {iid} (CVE): {len(multi)} scenario(s) have explosions at more "
+                          f"than one ignition location — full P_CVE applied to each "
+                          f"(TODO: review frequency double counting).")
+            else:
+                results_idx = _index_by_key(results_rows)
+
         with _timed('iteration'):
-            impact_mats, risk_mats, matched, unmatched = compute_event_live(evt, core_scenarios, results_idx)
+            impact_mats, risk_mats, matched, unmatched = compute_event_live(
+                evt, core_scenarios, results_idx, vul_by_loc)
 
         print(f"  matched={matched}  unmatched={unmatched}")
         if unmatched:
